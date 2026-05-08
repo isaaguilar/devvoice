@@ -1,6 +1,6 @@
 [package]
 name = "devvoice-desktop"
-version = "0.1.2"
+version = "0.1.4"
 description = "DevVoice desktop app"
 authors = ["you"]
 edition = "2021"
@@ -16,7 +16,7 @@ tauri-build = { version = "2.5.6", features = [] }
 apple-native-keyring-store = { version = "1.0.0", features = ["keychain"] }
 anyhow = "1.0.102"
 axum = "0.8"
-any-tts = { version = "0.1.1", default-features = false, features = ["download", "vibevoice", "metal"] }
+any-tts = { version = "0.1.1", default-features = false, features = ["download", "vibevoice", "kokoro", "metal"] }
 directories = "5"
 get-selected-text = "0.1.6"
 hf-hub = { version = "1.0.0-rc.0", features = ["blocking"] }

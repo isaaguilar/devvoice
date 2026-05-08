@@ -26,6 +26,7 @@ pub struct AppSnapshot {
     pub last_selection: Option<String>,
     pub last_prepared_text: Option<String>,
     pub last_error: Option<String>,
+    pub available_voices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -34,7 +35,8 @@ pub struct SettingsInput {
     pub gemini_enabled: bool,
     pub gemini_model: String,
     pub gemini_prompt: String,
-    pub voice_gender: crate::config::VoiceGender,
+    pub voice_model: crate::config::VoiceModel,
+    pub voice_preset: String,
     pub shortcut: String,
     pub api_key: Option<String>,
 }

@@ -34,12 +34,27 @@ pub fn normalize_shortcut(shortcut: &str) -> String {
         .replace("Ctrl", "Control")
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VoiceGender {
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VoiceModel {
     #[default]
-    Woman,
-    Man,
+    #[serde(
+        rename = "vibevoice_realtime",
+        alias = "woman",
+        alias = "man",
+        alias = "vibevoice_woman",
+        alias = "vibevoice_man",
+        alias = "vibe_voice_woman",
+        alias = "vibe_voice_man"
+    )]
+    VibeVoiceRealtime,
+    #[serde(
+        rename = "vibevoice",
+        alias = "vibevoice_expressive",
+        alias = "vibe_voice_expressive"
+    )]
+    VibeVoice,
+    #[serde(rename = "kokoro")]
+    Kokoro,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,8 +70,10 @@ pub struct AppConfig {
     pub gemini_prompt: String,
     #[serde(default = "default_shortcut")]
     pub shortcut: String,
+    #[serde(default, alias = "voiceGender", alias = "voiceChoice")]
+    pub voice_model: VoiceModel,
     #[serde(default)]
-    pub voice_gender: VoiceGender,
+    pub voice_preset: String,
     /// Port for the local HTTP API. Set to 0 to disable.
     #[serde(default = "default_http_port")]
     pub http_port: u16,
@@ -86,7 +103,8 @@ impl Default for AppConfig {
             gemini_model: DEFAULT_GEMINI_MODEL.to_owned(),
             gemini_prompt: DEFAULT_GEMINI_PROMPT.to_owned(),
             shortcut: DEFAULT_SHORTCUT.to_owned(),
-            voice_gender: VoiceGender::Woman,
+            voice_model: VoiceModel::VibeVoiceRealtime,
+            voice_preset: String::new(),
             http_port: DEFAULT_HTTP_PORT,
         }
     }

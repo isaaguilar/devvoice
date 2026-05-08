@@ -96,6 +96,7 @@ struct RuntimeState {
     last_error: Option<String>,
     model_ready: bool,
     playback_paused: bool,
+    available_voices: Vec<String>,
 }
 
 impl Default for RuntimeState {
@@ -108,6 +109,7 @@ impl Default for RuntimeState {
             last_error: None,
             model_ready: false,
             playback_paused: false,
+            available_voices: Vec::new(),
         }
     }
 }
@@ -149,6 +151,7 @@ impl AppRuntime {
             last_selection: runtime.last_selection.clone(),
             last_prepared_text: runtime.last_prepared_text.clone(),
             last_error: runtime.last_error.clone(),
+            available_voices: runtime.available_voices.clone(),
         }
     }
 
@@ -199,7 +202,8 @@ impl AppRuntime {
         if !input.gemini_prompt.trim().is_empty() {
             config.gemini_prompt = input.gemini_prompt.trim().to_owned();
         }
-        config.voice_gender = input.voice_gender;
+        config.voice_model = input.voice_model;
+        config.voice_preset = input.voice_preset;
         if !input.shortcut.trim().is_empty() {
             config.shortcut = normalize_shortcut(&input.shortcut);
         }
@@ -233,17 +237,19 @@ impl AppRuntime {
     }
 
     pub async fn warmup_model(&self, app: &AppHandle) -> Result<()> {
+        let voice_model = self.current_config().voice_model;
         self.mark_status(
             app,
             AppStatus::LoadingModel,
             "Downloading and warming the TTS model on Metal...",
         );
 
-        match self.tts.warmup().await {
+        match self.tts.warmup(voice_model).await {
             Ok(voices) => {
                 {
                     let mut runtime = self.runtime.lock().unwrap();
                     runtime.model_ready = true;
+                    runtime.available_voices = voices.clone();
                 }
                 self.mark_status(
                     app,
@@ -351,7 +357,7 @@ impl AppRuntime {
             self.mark_status(app, AppStatus::Synthesizing, status_detail);
 
             let (audio, voice_name) =
-                match self.tts.synthesize(&chunk, config.voice_gender).await {
+                match self.tts.synthesize(&chunk, config.voice_model, &config.voice_preset).await {
                     Ok(result) => result,
                     Err(error) => {
                         self.mark_error(app, error.to_string());
@@ -682,7 +688,20 @@ async fn save_settings(
     state: State<'_, AppRuntime>,
     input: SettingsInput,
 ) -> Result<AppSnapshot, String> {
-    state.save_settings(&app, input).map_err(|error| error.to_string())
+    let old_model = state.current_config().voice_model;
+    let snapshot = state.save_settings(&app, input).map_err(|error| error.to_string())?;
+
+    if snapshot.config.voice_model != old_model {
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let runtime = app_clone.state::<AppRuntime>();
+            if let Err(error) = runtime.warmup_model(&app_clone).await {
+                eprintln!("warmup after model change failed: {error}");
+            }
+        });
+    }
+
+    Ok(snapshot)
 }
 
 #[tauri::command]

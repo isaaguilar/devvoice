@@ -26,7 +26,8 @@ const elements = {
   apiKey: document.querySelector("#api-key"),
   geminiModel: document.querySelector("#gemini-model"),
   geminiPrompt: document.querySelector("#gemini-prompt"),
-  voiceGender: document.querySelector("#voice-gender"),
+  voiceModel: document.querySelector("#voice-model"),
+  voicePreset: document.querySelector("#voice-preset"),
   shortcut: document.querySelector("#shortcut"),
   manualText: document.querySelector("#manual-text"),
   speakSelection: document.querySelector("#speak-selection"),
@@ -56,13 +57,38 @@ function setText(element, value) {
   }
 }
 
+function populateVoicePresets(voices, selectedPreset) {
+  const select = elements.voicePreset;
+  if (!select) return;
+  while (select.options.length > 1) {
+    select.remove(1);
+  }
+  for (const voice of voices) {
+    const option = document.createElement("option");
+    option.value = voice;
+    option.textContent = voice;
+    select.appendChild(option);
+  }
+  select.value = selectedPreset;
+}
+
+function clearVoicePresets() {
+  const select = elements.voicePreset;
+  if (!select) return;
+  while (select.options.length > 1) {
+    select.remove(1);
+  }
+  select.value = "";
+}
+
 function currentSettingsInput() {
   const apiKey = requireElement(elements.apiKey, "#api-key").value.trim();
   return {
     geminiEnabled: requireElement(elements.geminiEnabled, "#gemini-enabled").checked,
     geminiModel: requireElement(elements.geminiModel, "#gemini-model").value.trim(),
     geminiPrompt: requireElement(elements.geminiPrompt, "#gemini-prompt").value.trim(),
-    voiceGender: requireElement(elements.voiceGender, "#voice-gender").value,
+    voiceModel: requireElement(elements.voiceModel, "#voice-model").value,
+    voicePreset: requireElement(elements.voicePreset, "#voice-preset").value,
     shortcut: requireElement(elements.shortcut, "#shortcut").value.trim(),
     apiKey: apiKey.length > 0 ? apiKey : null,
   };
@@ -73,7 +99,8 @@ function renderSettings(snapshot) {
   requireElement(elements.geminiEnabled, "#gemini-enabled").checked = snapshot.config.geminiEnabled;
   requireElement(elements.geminiModel, "#gemini-model").value = snapshot.config.geminiModel;
   requireElement(elements.geminiPrompt, "#gemini-prompt").value = snapshot.config.geminiPrompt;
-  requireElement(elements.voiceGender, "#voice-gender").value = snapshot.config.voiceGender;
+  requireElement(elements.voiceModel, "#voice-model").value = snapshot.config.voiceModel;
+  populateVoicePresets(snapshot.availableVoices || [], snapshot.config.voicePreset || "");
   requireElement(elements.shortcut, "#shortcut").value = snapshot.config.shortcut;
   apiKeyInput.placeholder = snapshot.apiKeyPresent
     ? "Saved in Keychain. Leave blank to keep it."
@@ -106,6 +133,7 @@ function renderSnapshot(snapshot) {
   setText(elements.lastSelection, snapshot.lastSelection || "-");
   setText(elements.lastOutput, snapshot.lastPreparedText || "-");
   setText(elements.lastError, snapshot.lastError || "-");
+  populateVoicePresets(snapshot.availableVoices || [], snapshot.config.voicePreset || "");
   requireElement(elements.pausePlayback, "#pause-playback").textContent = snapshot.playbackPaused
     ? "Resume"
     : "Pause";
@@ -150,6 +178,18 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
+    setBusy(true);
+    try {
+      const snapshot = await invoke("save_settings", { input: currentSettingsInput() });
+      renderSettings(snapshot);
+      renderSnapshot(snapshot);
+    } finally {
+      setBusy(false);
+    }
+  });
+
+  requireElement(elements.voiceModel, "#voice-model").addEventListener("change", async () => {
+    clearVoicePresets();
     setBusy(true);
     try {
       const snapshot = await invoke("save_settings", { input: currentSettingsInput() });

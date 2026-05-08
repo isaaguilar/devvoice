@@ -1,4 +1,4 @@
-use crate::config::VoiceGender;
+use crate::config::VoiceModel;
 use any_tts::{
     AudioSamples, DType, DeviceSelection, ModelType, SynthesisRequest, TtsConfig, TtsModel,
     load_model,
@@ -21,9 +21,24 @@ use tokio::sync::OnceCell;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-const MODEL_OWNER: &str = "microsoft";
-const MODEL_NAME: &str = "VibeVoice-Realtime-0.5B";
-const MODEL_ID: &str = "microsoft/VibeVoice-Realtime-0.5B";
+// VibeVoice Realtime 0.5B
+const VR_OWNER: &str = "microsoft";
+const VR_NAME: &str = "VibeVoice-Realtime-0.5B";
+const VR_ID: &str = "microsoft/VibeVoice-Realtime-0.5B";
+const VR_DIR: &str = "vibevoice-realtime-0.5b";
+
+// VibeVoice 1.5B
+const VV_OWNER: &str = "microsoft";
+const VV_NAME: &str = "VibeVoice-1.5B";
+const VV_ID: &str = "microsoft/VibeVoice-1.5B";
+const VV_DIR: &str = "vibevoice-1.5b";
+
+// Kokoro 82M
+const KO_OWNER: &str = "hexgrad";
+const KO_NAME: &str = "Kokoro-82M";
+const KO_ID: &str = "hexgrad/Kokoro-82M";
+const KO_DIR: &str = "kokoro-82m";
+
 const TOKENIZER_FALLBACK_OWNER: &str = "Qwen";
 const TOKENIZER_FALLBACK_MODEL: &str = "Qwen2.5-0.5B";
 const VOICE_PRESET_BASE_URL: &str =
@@ -50,19 +65,23 @@ struct LoadedModel {
 
 pub struct TtsService {
     asset_root: PathBuf,
-    model: OnceCell<Arc<LoadedModel>>,
+    vibevoice_realtime: OnceCell<Arc<LoadedModel>>,
+    vibevoice: OnceCell<Arc<LoadedModel>>,
+    kokoro: OnceCell<Arc<LoadedModel>>,
 }
 
 impl TtsService {
     pub fn new(asset_root: PathBuf) -> Self {
         Self {
             asset_root,
-            model: OnceCell::new(),
+            vibevoice_realtime: OnceCell::new(),
+            vibevoice: OnceCell::new(),
+            kokoro: OnceCell::new(),
         }
     }
 
-    pub async fn warmup(&self) -> Result<Vec<String>> {
-        Ok(self.ensure_loaded().await?.voices.clone())
+    pub async fn warmup(&self, voice_model: VoiceModel) -> Result<Vec<String>> {
+        Ok(self.ensure_loaded(voice_model).await?.voices.clone())
     }
 
     pub fn capture_selection(&self) -> Result<CaptureResult> {
@@ -86,62 +105,99 @@ impl TtsService {
     pub async fn synthesize(
         &self,
         text: &str,
-        voice_gender: VoiceGender,
+        voice_model: VoiceModel,
+        voice_preset: &str,
     ) -> Result<(AudioSamples, Option<String>)> {
         let spoken_text = normalize_technical_text(text);
-        let loaded = self.ensure_loaded().await?;
+        let loaded = self.ensure_loaded(voice_model).await?;
         let voices = loaded.voices.clone();
         let model = Arc::clone(&loaded.model);
+        let preset = voice_preset.to_owned();
 
         tokio::task::spawn_blocking(move || {
-            let voice = select_voice(&voices, voice_gender);
+            let voice = resolve_voice(&voices, &preset);
             if let Some(ref voice_name) = voice {
                 info!("Using voice preset: {voice_name}");
             } else {
                 info!("Using model default voice preset");
             }
 
-            let mut request = SynthesisRequest::new(&spoken_text)
-                .with_language("en")
-                .with_instruct(STYLE_PROMPT)
-                .with_temperature(0.15);
+            let request = build_request(&spoken_text, voice_model, voice.as_deref());
 
-            if let Some(ref voice_name) = voice {
-                request = request.with_voice(voice_name.clone());
-            }
-
+            let label = model_label(voice_model);
             let audio = model
                 .synthesize(&request)
-                .context("synthesize speech with VibeVoice Realtime")?;
+                .context(format!("synthesize speech with {label}"))?;
             Ok((audio, voice))
         })
         .await
         .context("wait for synthesis task")?
     }
 
-    async fn ensure_loaded(&self) -> Result<Arc<LoadedModel>> {
-        self.model
-            .get_or_try_init(|| async {
-                let asset_root = self.asset_root.clone();
-                tokio::task::spawn_blocking(move || load_model_from_disk(asset_root))
-                    .await
-                    .context("wait for model load task")?
-                    .map(Arc::new)
-            })
-            .await
-            .map(Arc::clone)
+    async fn ensure_loaded(&self, voice_model: VoiceModel) -> Result<Arc<LoadedModel>> {
+        let cell = match voice_model {
+            VoiceModel::VibeVoiceRealtime => &self.vibevoice_realtime,
+            VoiceModel::VibeVoice => &self.vibevoice,
+            VoiceModel::Kokoro => &self.kokoro,
+        };
+
+        cell.get_or_try_init(|| {
+            let asset_root = self.asset_root.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    match voice_model {
+                        VoiceModel::VibeVoiceRealtime => load_vibevoice_realtime(asset_root),
+                        VoiceModel::VibeVoice => load_vibevoice(asset_root),
+                        VoiceModel::Kokoro => load_kokoro(asset_root),
+                    }
+                })
+                .await
+                .context("wait for model load task")?
+                .map(Arc::new)
+            }
+        })
+        .await
+        .map(Arc::clone)
     }
 }
 
-fn load_model_from_disk(asset_root: PathBuf) -> Result<LoadedModel> {
-    let cache_dir = prepare_model_snapshot(&asset_root)?;
+fn load_vibevoice_realtime(asset_root: PathBuf) -> Result<LoadedModel> {
+    let cache_dir = prepare_vibevoice_realtime_snapshot(&asset_root)?;
     let config = TtsConfig::new(ModelType::VibeVoiceRealtime)
-        .with_hf_model_id(MODEL_ID)
+        .with_hf_model_id(VR_ID)
         .with_model_path(cache_dir.to_string_lossy().into_owned())
         .with_device(DeviceSelection::Metal(0))
         .with_dtype(DType::F32);
 
     let model = load_model(config).context("load VibeVoice Realtime on Metal")?;
+    let model: Arc<dyn TtsModel> = Arc::from(model);
+    let voices = model.supported_voices();
+    Ok(LoadedModel { model, voices })
+}
+
+fn load_vibevoice(asset_root: PathBuf) -> Result<LoadedModel> {
+    let cache_dir = prepare_vibevoice_snapshot(&asset_root)?;
+    let config = TtsConfig::new(ModelType::VibeVoice)
+        .with_hf_model_id(VV_ID)
+        .with_model_path(cache_dir.to_string_lossy().into_owned())
+        .with_device(DeviceSelection::Metal(0))
+        .with_dtype(DType::F32);
+
+    let model = load_model(config).context("load VibeVoice 1.5B on Metal")?;
+    let model: Arc<dyn TtsModel> = Arc::from(model);
+    let voices = model.supported_voices();
+    Ok(LoadedModel { model, voices })
+}
+
+fn load_kokoro(asset_root: PathBuf) -> Result<LoadedModel> {
+    let cache_dir = prepare_kokoro_snapshot(&asset_root)?;
+    let config = TtsConfig::new(ModelType::Kokoro)
+        .with_hf_model_id(KO_ID)
+        .with_model_path(cache_dir.to_string_lossy().into_owned())
+        .with_device(DeviceSelection::Metal(0))
+        .with_dtype(DType::F32);
+
+    let model = load_model(config).context("load Kokoro-82M on Metal")?;
     let model: Arc<dyn TtsModel> = Arc::from(model);
     let voices = model.supported_voices();
     Ok(LoadedModel { model, voices })
@@ -286,14 +342,14 @@ pub fn initialize_tracing() -> Result<()> {
     Ok(())
 }
 
-fn prepare_model_snapshot(asset_root: &Path) -> Result<PathBuf> {
+fn prepare_vibevoice_realtime_snapshot(asset_root: &Path) -> Result<PathBuf> {
     let cache_root = asset_root.join("hf-cache");
     std::fs::create_dir_all(&cache_root)
         .with_context(|| format!("create Hugging Face cache directory {}", cache_root.display()))?;
 
-    let local_dir = asset_root.join("vibevoice-realtime-0.5b");
+    let local_dir = asset_root.join(VR_DIR);
     std::fs::create_dir_all(&local_dir)
-        .with_context(|| format!("create DevVoice model directory {}", local_dir.display()))?;
+        .with_context(|| format!("create model directory {}", local_dir.display()))?;
 
     let client = hf_hub::HFClient::builder()
         .cache_dir(&cache_root)
@@ -301,17 +357,17 @@ fn prepare_model_snapshot(asset_root: &Path) -> Result<PathBuf> {
         .context("create hf-hub client")?;
     let client = HFClientSync::from_inner(client).context("create blocking hf-hub client")?;
 
-    let repo = client.model(MODEL_OWNER, MODEL_NAME);
+    let repo = client.model(VR_OWNER, VR_NAME);
     repo.download_file()
         .filename("config.json")
         .local_dir(local_dir.clone())
         .send()
-        .context("download VibeVoice config.json")?;
+        .context("download VibeVoice Realtime config.json")?;
     repo.download_file()
         .filename("model.safetensors")
         .local_dir(local_dir.clone())
         .send()
-        .context("download VibeVoice model.safetensors")?;
+        .context("download VibeVoice Realtime model.safetensors")?;
     let _ = repo
         .download_file()
         .filename("preprocessor_config.json")
@@ -327,7 +383,7 @@ fn prepare_model_snapshot(asset_root: &Path) -> Result<PathBuf> {
     if !tokenizer_path.exists() {
         info!(
             "tokenizer.json not published in {}, fetching fallback tokenizer from {}/{}",
-            MODEL_ID, TOKENIZER_FALLBACK_OWNER, TOKENIZER_FALLBACK_MODEL
+            VR_ID, TOKENIZER_FALLBACK_OWNER, TOKENIZER_FALLBACK_MODEL
         );
         client
             .model(TOKENIZER_FALLBACK_OWNER, TOKENIZER_FALLBACK_MODEL)
@@ -339,12 +395,128 @@ fn prepare_model_snapshot(asset_root: &Path) -> Result<PathBuf> {
     }
 
     download_voice_presets(&local_dir.join("voices"))?;
-    ensure_required_assets(&local_dir)?;
+    ensure_required_assets(&local_dir, &["config.json", "tokenizer.json", "model.safetensors"])?;
     Ok(local_dir)
 }
 
-fn ensure_required_assets(model_dir: &Path) -> Result<()> {
-    for file in ["config.json", "tokenizer.json", "model.safetensors"] {
+fn prepare_vibevoice_snapshot(asset_root: &Path) -> Result<PathBuf> {
+    let cache_root = asset_root.join("hf-cache");
+    std::fs::create_dir_all(&cache_root)
+        .with_context(|| format!("create Hugging Face cache directory {}", cache_root.display()))?;
+
+    let local_dir = asset_root.join(VV_DIR);
+    std::fs::create_dir_all(&local_dir)
+        .with_context(|| format!("create model directory {}", local_dir.display()))?;
+
+    let client = hf_hub::HFClient::builder()
+        .cache_dir(&cache_root)
+        .build()
+        .context("create hf-hub client")?;
+    let client = HFClientSync::from_inner(client).context("create blocking hf-hub client")?;
+
+    let repo = client.model(VV_OWNER, VV_NAME);
+    repo.download_file()
+        .filename("config.json")
+        .local_dir(local_dir.clone())
+        .send()
+        .context("download VibeVoice 1.5B config.json")?;
+
+    // VibeVoice 1.5B may use sharded weights; try single file first, then sharded.
+    let single = repo
+        .download_file()
+        .filename("model.safetensors")
+        .local_dir(local_dir.clone())
+        .send();
+    if single.is_err() {
+        info!("Single model.safetensors not found for VibeVoice 1.5B, trying sharded weights");
+        let _ = repo
+            .snapshot_download()
+            .allow_patterns(vec!["model-*.safetensors".to_string()])
+            .local_dir(local_dir.clone())
+            .send();
+    }
+
+    let _ = repo
+        .download_file()
+        .filename("preprocessor_config.json")
+        .local_dir(local_dir.clone())
+        .send();
+
+    let tokenizer_path = local_dir.join("tokenizer.json");
+    if !tokenizer_path.exists() {
+        info!(
+            "tokenizer.json not published in {}, fetching fallback tokenizer from {}/{}",
+            VV_ID, TOKENIZER_FALLBACK_OWNER, TOKENIZER_FALLBACK_MODEL
+        );
+        let tokenizer_result = repo
+            .download_file()
+            .filename("tokenizer.json")
+            .local_dir(local_dir.clone())
+            .send();
+        if tokenizer_result.is_err() {
+            client
+                .model(TOKENIZER_FALLBACK_OWNER, TOKENIZER_FALLBACK_MODEL)
+                .download_file()
+                .filename("tokenizer.json")
+                .local_dir(local_dir.clone())
+                .send()
+                .context("download fallback tokenizer.json for VibeVoice 1.5B")?;
+        }
+    }
+
+    ensure_required_assets(&local_dir, &["config.json", "tokenizer.json"])?;
+    Ok(local_dir)
+}
+
+fn prepare_kokoro_snapshot(asset_root: &Path) -> Result<PathBuf> {
+    let cache_root = asset_root.join("hf-cache");
+    std::fs::create_dir_all(&cache_root)
+        .with_context(|| format!("create Hugging Face cache directory {}", cache_root.display()))?;
+
+    let local_dir = asset_root.join(KO_DIR);
+    std::fs::create_dir_all(&local_dir)
+        .with_context(|| format!("create model directory {}", local_dir.display()))?;
+
+    let client = hf_hub::HFClient::builder()
+        .cache_dir(&cache_root)
+        .build()
+        .context("create hf-hub client")?;
+    let client = HFClientSync::from_inner(client).context("create blocking hf-hub client")?;
+
+    let repo = client.model(KO_OWNER, KO_NAME);
+    repo.download_file()
+        .filename("config.json")
+        .local_dir(local_dir.clone())
+        .send()
+        .context("download Kokoro config.json")?;
+
+    // Kokoro uses a .pth weight file; try safetensors first, then .pth.
+    let safetensors = repo
+        .download_file()
+        .filename("model.safetensors")
+        .local_dir(local_dir.clone())
+        .send();
+    if safetensors.is_err() {
+        info!("model.safetensors not found for Kokoro, trying .pth weights");
+        let _ = repo
+            .snapshot_download()
+            .allow_patterns(vec!["*.pth".to_string()])
+            .local_dir(local_dir.clone())
+            .send();
+    }
+
+    let _ = repo
+        .snapshot_download()
+        .allow_patterns(vec!["voices/*.pt".to_string()])
+        .local_dir(local_dir.clone())
+        .send();
+
+    ensure_required_assets(&local_dir, &["config.json"])?;
+    Ok(local_dir)
+}
+
+fn ensure_required_assets(model_dir: &Path, required: &[&str]) -> Result<()> {
+    for file in required {
         let path = model_dir.join(file);
         if !path.exists() {
             bail!("Missing required model asset: {}", path.display());
@@ -407,33 +579,53 @@ fn ensure_accessibility() -> Result<()> {
     );
 }
 
-fn select_voice(voices: &[String], voice_gender: VoiceGender) -> Option<String> {
-    let preferred = match voice_gender {
-        VoiceGender::Woman => &["en-emma_woman", "en-grace_woman", "emma", "grace"][..],
-        VoiceGender::Man => &[
-            "en-davis_man",
-            "en-frank_man",
-            "en-mike_man",
-            "en-carter_man",
-            "in-samuel_man",
-            "davis",
-            "frank",
-            "mike",
-            "carter",
-            "samuel",
-        ][..],
-    };
+fn resolve_voice(voices: &[String], preset: &str) -> Option<String> {
+    if preset.is_empty() {
+        return voices.first().cloned();
+    }
+    let lower = preset.to_ascii_lowercase();
+    voices
+        .iter()
+        .find(|v| v.to_ascii_lowercase() == lower)
+        .or_else(|| {
+            voices
+                .iter()
+                .find(|v| v.to_ascii_lowercase().contains(&lower))
+        })
+        .cloned()
+        .or_else(|| voices.first().cloned())
+}
 
-    for needle in preferred {
-        if let Some(voice) = voices
-            .iter()
-            .find(|voice| voice.to_ascii_lowercase().contains(needle))
-        {
-            return Some(voice.clone());
+fn build_request(text: &str, model: VoiceModel, voice: Option<&str>) -> SynthesisRequest {
+    let mut request = SynthesisRequest::new(text).with_language("en");
+
+    match model {
+        VoiceModel::VibeVoiceRealtime => {
+            request = request
+                .with_instruct(STYLE_PROMPT)
+                .with_temperature(0.15);
+        }
+        VoiceModel::VibeVoice => {
+            request = request.with_temperature(0.5);
+        }
+        VoiceModel::Kokoro => {
+            // Kokoro uses its built-in phonemizer; minimal config needed.
         }
     }
 
-    voices.first().cloned()
+    if let Some(name) = voice {
+        request = request.with_voice(name.to_owned());
+    }
+
+    request
+}
+
+fn model_label(model: VoiceModel) -> &'static str {
+    match model {
+        VoiceModel::VibeVoiceRealtime => "VibeVoice Realtime 0.5B",
+        VoiceModel::VibeVoice => "VibeVoice 1.5B",
+        VoiceModel::Kokoro => "Kokoro-82M",
+    }
 }
 
 fn normalize_technical_text(input: &str) -> String {
