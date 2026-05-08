@@ -1,0 +1,29 @@
+# Rust build output
+/target
+/src-tauri/target
+
+# Frontend build output
+/dist
+/node_modules
+
+# Tauri generated files
+/src-tauri/gen
+/src-tauri/icons/icon.iconset
+/src-tauri/icons/master-source.png
+/src-tauri/icons/tray-icon.png
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/
+
+# Package manager logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*

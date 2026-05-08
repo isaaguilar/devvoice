@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 500" width="100%" height="100%">
+  <rect width="500" height="500" fill="#2196F3" />
+
+  <g fill="#9E9E9E" stroke="#111111" stroke-width="8" stroke-linejoin="round">
+    <rect x="360" y="235" width="40" height="30" />
+    <circle cx="430" cy="190" r="25" />
+    <circle cx="430" cy="310" r="25" />
+    <rect x="395" y="210" width="20" height="80" rx="10" />
+  </g>
+  <circle cx="430" cy="190" r="10" fill="#111111" />
+  <circle cx="430" cy="310" r="10" fill="#111111" />
+
+  <polygon points="135,225 365,235 365,265 135,275" fill="#111111" />
+
+  <g stroke="#111111" stroke-width="10" stroke-linecap="round">
+    <line x1="180" y1="330" x2="180" y2="400" />
+    <line x1="280" y1="340" x2="280" y2="400" />
+  </g>
+  <g fill="#FFEB3B" stroke="#111111" stroke-width="8" stroke-linejoin="round">
+    <rect x="140" y="385" width="60" height="30" rx="4" />
+    <rect x="240" y="385" width="60" height="30" rx="4" />
+  </g>
+
+  <g>
+    <path d="M 140 225 L 360 235 L 360 145 C 240 145 110 145 140 225 Z" fill="#E53935" stroke="#111111" stroke-width="8" stroke-linejoin="round" />
+
+    <g fill="#FFFFFF" stroke="#111111" stroke-width="6">
+      <rect x="150" y="180" width="26" height="55" rx="6" />
+      <rect x="185" y="184" width="26" height="55" rx="6" />
+      <rect x="220" y="188" width="26" height="55" rx="6" />
+      <rect x="255" y="192" width="26" height="55" rx="6" />
+      <rect x="290" y="196" width="26" height="55" rx="6" />
+      <rect x="325" y="200" width="26" height="55" rx="6" />
+    </g>
+  </g>
+
+  <g>
+    <path d="M 140 275 L 360 265 L 360 355 C 240 355 110 355 140 275 Z" fill="#E53935" stroke="#111111" stroke-width="8" stroke-linejoin="round" />
+
+    <g fill="#FFFFFF" stroke="#111111" stroke-width="6">
+      <rect x="150" y="265" width="26" height="55" rx="6" />
+      <rect x="185" y="261" width="26" height="55" rx="6" />
+      <rect x="220" y="257" width="26" height="55" rx="6" />
+      <rect x="255" y="253" width="26" height="55" rx="6" />
+      <rect x="290" y="249" width="26" height="55" rx="6" />
+      <rect x="325" y="245" width="26" height="55" rx="6" />
+    </g>
+  </g>
+
+  <circle cx="360" cy="250" r="14" fill="#9E9E9E" stroke="#111111" stroke-width="8" />
+</svg>

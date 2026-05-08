@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DevVoice</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/main.js" defer></script>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel hero">
+        <div>
+          <p class="eyebrow">macOS tray TTS</p>
+          <h1>DevVoice</h1>
+          <p class="lede">Grab selected text, optionally rewrite it with Gemini, then speak it with a local Metal-backed neural voice.</p>
+        </div>
+        <div class="hero-status">
+          <span id="status-pill" class="status-pill status-pill--idle">Idle</span>
+          <p id="status-detail" class="muted">Starting up...</p>
+          <p id="hotkey-label" class="mono">Hotkey: -</p>
+          <p id="config-path" class="mono">Config: -</p>
+          <p id="log-path" class="mono">Log: -</p>
+          <p id="http-api-label" class="mono">HTTP API: -</p>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>Speak</h2>
+            <p>Use the global shortcut or these controls to test the pipeline end to end.</p>
+          </div>
+          <div class="button-row">
+            <button id="show-window" type="button" class="secondary">Focus window</button>
+            <button id="open-log" type="button" class="secondary">Open log</button>
+          </div>
+        </div>
+
+        <div class="button-row">
+          <button id="speak-selection" type="button">Speak selection</button>
+          <button id="pause-playback" type="button" class="secondary">Pause</button>
+          <button id="stop-playback" type="button" class="danger">Stop</button>
+        </div>
+
+        <label class="field">
+          <span>Manual text</span>
+          <textarea id="manual-text" rows="7" placeholder="Paste text here to test the Gemini rewrite and TTS flow without relying on selected-text capture."></textarea>
+        </label>
+
+        <div class="button-row">
+          <button id="speak-manual" type="button">Speak manual text</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>Settings</h2>
+            <p>The local VibeVoice model and voice assets download automatically into app storage on first run.</p>
+          </div>
+          <p id="api-key-state" class="badge">Gemini disabled.</p>
+        </div>
+
+        <form id="settings-form" class="settings-grid">
+          <label class="field field--toggle">
+            <input id="gemini-enabled" type="checkbox" />
+            <span>Enable Gemini rewrite before TTS</span>
+          </label>
+
+          <label class="field">
+            <span>Gemini API key</span>
+            <input id="api-key" type="password" placeholder="Leave blank to keep the saved key" autocomplete="off" />
+            <small class="field-note">Only enter a value here when you want to replace the saved key.</small>
+          </label>
+
+          <label class="field">
+            <span>Gemini model</span>
+            <input id="gemini-model" type="text" />
+          </label>
+
+          <label class="field field--full">
+            <span>Rewrite prompt</span>
+            <textarea id="gemini-prompt" rows="6"></textarea>
+          </label>
+
+          <label class="field">
+            <span>Voice</span>
+            <select id="voice-gender">
+              <option value="woman">Woman</option>
+              <option value="man">Man</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Global hotkey</span>
+            <input id="shortcut" type="text" placeholder="Command+Control+S" />
+            <small class="field-note">Default hotkey: Command+Control+S.</small>
+          </label>
+
+          <div class="field field--full">
+            <button id="save-settings" type="submit">Save settings</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>Latest run</h2>
+            <p>The raw selection, AI-enhanced rewrite, and errors update live while synthesis is running.</p>
+          </div>
+        </div>
+
+        <div class="result-grid">
+          <article class="result-card">
+            <h3>Selected text</h3>
+            <pre id="last-selection" class="mono">-</pre>
+          </article>
+          <article class="result-card">
+            <h3>Text sent to the synthesizer</h3>
+            <pre id="last-output" class="mono">-</pre>
+          </article>
+        </div>
+
+        <article class="result-card error-card">
+          <h3>Last error</h3>
+          <pre id="last-error" class="mono">-</pre>
+        </article>
+      </section>
+    </main>
+  </body>
+</html>
