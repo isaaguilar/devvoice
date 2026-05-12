@@ -9,7 +9,6 @@ if [[ ! -d "$ROOT_DIR/node_modules" ]]; then
   (cd "$ROOT_DIR" && npm install)
 fi
 
-"$ROOT_DIR/scripts/bump-version.sh"
 (cd "$ROOT_DIR" && npm run tauri:build)
 
 echo "Created app bundle at $APP_DIR"
