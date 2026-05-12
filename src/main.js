@@ -39,10 +39,15 @@ const elements = {
   lastSelection: document.querySelector("#last-selection"),
   lastOutput: document.querySelector("#last-output"),
   lastError: document.querySelector("#last-error"),
+  modelInstructionsTitle: document.querySelector("#model-instructions-title"),
+  modelInstructionsSummary: document.querySelector("#model-instructions-summary"),
+  modelInstructionsAttributes: document.querySelector("#model-instructions-attributes"),
+  modelInstructionsExample: document.querySelector("#model-instructions-example"),
 };
 
 let configPath = "-";
 let logPath = "-";
+let currentTtsPrecision = "auto";
 
 function requireElement(element, selector) {
   if (!element) {
@@ -89,6 +94,7 @@ function currentSettingsInput() {
     geminiPrompt: requireElement(elements.geminiPrompt, "#gemini-prompt").value.trim(),
     voiceModel: requireElement(elements.voiceModel, "#voice-model").value,
     voicePreset: requireElement(elements.voicePreset, "#voice-preset").value,
+    ttsPrecision: currentTtsPrecision,
     shortcut: requireElement(elements.shortcut, "#shortcut").value.trim(),
     apiKey: apiKey.length > 0 ? apiKey : null,
   };
@@ -101,6 +107,7 @@ function renderSettings(snapshot) {
   requireElement(elements.geminiPrompt, "#gemini-prompt").value = snapshot.config.geminiPrompt;
   requireElement(elements.voiceModel, "#voice-model").value = snapshot.config.voiceModel;
   populateVoicePresets(snapshot.availableVoices || [], snapshot.config.voicePreset || "");
+  currentTtsPrecision = snapshot.config.ttsPrecision || "auto";
   requireElement(elements.shortcut, "#shortcut").value = snapshot.config.shortcut;
   apiKeyInput.placeholder = snapshot.apiKeyPresent
     ? "Saved in Keychain. Leave blank to keep it."
@@ -112,6 +119,53 @@ function renderSettings(snapshot) {
       : "Gemini rewrite is enabled, but no API key is stored in Keychain yet."
     : "Gemini rewrite is disabled.";
   setText(elements.apiKeyState, apiState);
+}
+
+function renderModelInstructions(snapshot) {
+  const instructions = snapshot.modelInstructions;
+  if (!instructions) {
+    return;
+  }
+
+  setText(elements.modelInstructionsTitle, instructions.modelLabel || "-");
+  setText(elements.modelInstructionsSummary, instructions.summary || "-");
+  setText(elements.modelInstructionsExample, instructions.curlExample || "-");
+
+  const container = elements.modelInstructionsAttributes;
+  if (!container) {
+    return;
+  }
+
+  container.innerHTML = "";
+  const attributes = instructions.attributes || [];
+  if (attributes.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "muted";
+    empty.textContent = "No per-request query params are exposed for this model yet.";
+    container.appendChild(empty);
+    return;
+  }
+
+  for (const attribute of attributes) {
+    const card = document.createElement("article");
+    card.className = "instruction-item";
+
+    const label = document.createElement("strong");
+    label.textContent = `${attribute.queryParam}`;
+
+    const title = document.createElement("p");
+    title.className = "instruction-item__title";
+    title.textContent = attribute.label;
+
+    const description = document.createElement("p");
+    description.className = "muted";
+    description.textContent = attribute.description;
+
+    card.appendChild(label);
+    card.appendChild(title);
+    card.appendChild(description);
+    container.appendChild(card);
+  }
 }
 
 function renderSnapshot(snapshot) {
@@ -133,6 +187,7 @@ function renderSnapshot(snapshot) {
   setText(elements.lastSelection, snapshot.lastSelection || "-");
   setText(elements.lastOutput, snapshot.lastPreparedText || "-");
   setText(elements.lastError, snapshot.lastError || "-");
+  renderModelInstructions(snapshot);
   populateVoicePresets(snapshot.availableVoices || [], snapshot.config.voicePreset || "");
   requireElement(elements.pausePlayback, "#pause-playback").textContent = snapshot.playbackPaused
     ? "Resume"

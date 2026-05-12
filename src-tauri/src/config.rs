@@ -34,7 +34,7 @@ pub fn normalize_shortcut(shortcut: &str) -> String {
         .replace("Ctrl", "Control")
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum VoiceModel {
     #[default]
     #[serde(
@@ -53,8 +53,34 @@ pub enum VoiceModel {
         alias = "vibe_voice_expressive"
     )]
     VibeVoice,
+    #[serde(rename = "parler_tts", alias = "parler", alias = "parler_tts_mini")]
+    ParlerTts,
     #[serde(rename = "kokoro")]
     Kokoro,
+}
+
+impl VoiceModel {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            VoiceModel::VibeVoiceRealtime => "VibeVoice Realtime 0.5B",
+            VoiceModel::VibeVoice => "VibeVoice 1.5B",
+            VoiceModel::ParlerTts => "Parler-TTS Mini v1",
+            VoiceModel::Kokoro => "Kokoro-82M",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum TtsPrecision {
+    #[default]
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "f32")]
+    F32,
+    #[serde(rename = "f16")]
+    F16,
+    #[serde(rename = "bf16")]
+    BF16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +100,8 @@ pub struct AppConfig {
     pub voice_model: VoiceModel,
     #[serde(default)]
     pub voice_preset: String,
+    #[serde(default, alias = "precision", alias = "voicePrecision")]
+    pub tts_precision: TtsPrecision,
     /// Port for the local HTTP API. Set to 0 to disable.
     #[serde(default = "default_http_port")]
     pub http_port: u16,
@@ -105,6 +133,7 @@ impl Default for AppConfig {
             shortcut: DEFAULT_SHORTCUT.to_owned(),
             voice_model: VoiceModel::VibeVoiceRealtime,
             voice_preset: String::new(),
+            tts_precision: TtsPrecision::Auto,
             http_port: DEFAULT_HTTP_PORT,
         }
     }

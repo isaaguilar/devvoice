@@ -1,15 +1,16 @@
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, post};
 use axum::Router;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use tauri::{AppHandle, Manager};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
 use crate::AppRuntime;
+use crate::state::SpeechOverrides;
 
 #[derive(Clone)]
 struct HttpState {
@@ -45,8 +46,15 @@ struct StatusResponse {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct SpeakQuery {
+    #[serde(flatten)]
+    overrides: SpeechOverrides,
+}
+
 async fn speak_handler(
     State(state): State<HttpState>,
+    Query(query): Query<SpeakQuery>,
     body: String,
 ) -> (StatusCode, Json<EnqueueResponse>) {
     let text = body.trim().to_owned();
@@ -63,16 +71,26 @@ async fn speak_handler(
     }
 
     let runtime = state.app.state::<AppRuntime>();
-    let position = runtime.speech_queue.enqueue(text);
-    (
-        StatusCode::OK,
-        Json(EnqueueResponse {
-            ok: true,
-            queued: true,
-            position,
-            error: None,
-        }),
-    )
+    match runtime.enqueue_text(&state.app, text, query.overrides) {
+        Ok(position) => (
+            StatusCode::OK,
+            Json(EnqueueResponse {
+                ok: true,
+                queued: true,
+                position,
+                error: None,
+            }),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(EnqueueResponse {
+                ok: false,
+                queued: false,
+                position: 0,
+                error: Some(error.to_string()),
+            }),
+        ),
+    }
 }
 
 async fn status_handler(State(state): State<HttpState>) -> Json<StatusResponse> {

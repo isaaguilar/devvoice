@@ -54,13 +54,13 @@
       </section>
 
       <section class="panel">
-        <div class="panel-head">
-          <div>
-            <h2>Settings</h2>
-            <p>Voice models (VibeVoice and Kokoro) download automatically into app storage on first use.</p>
+          <div class="panel-head">
+            <div>
+              <h2>Settings</h2>
+              <p>Voice models download automatically into app storage on first use.</p>
+            </div>
+            <p id="api-key-state" class="badge">Gemini disabled.</p>
           </div>
-          <p id="api-key-state" class="badge">Gemini disabled.</p>
-        </div>
 
         <form id="settings-form" class="settings-grid">
           <label class="field field--toggle">
@@ -89,6 +89,7 @@
             <select id="voice-model">
               <option value="vibevoice_realtime">VibeVoice Realtime 0.5B (Microsoft) -- Fast, sub-300ms latency</option>
               <option value="vibevoice">VibeVoice 1.5B (Microsoft) -- Expressive, rich prosody, higher quality</option>
+              <option value="parler_tts">Parler-TTS Mini v1 (Hugging Face) -- Descriptive voice control, higher startup cost</option>
               <option value="kokoro">Kokoro 82M (hexgrad, 9M+ downloads) -- Lightweight, natural, blazing fast</option>
             </select>
           </label>
@@ -111,6 +112,33 @@
             <button id="save-settings" type="submit">Save settings</button>
           </div>
         </form>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>Model Instructions</h2>
+            <p>API requests can override a subset of model-specific attributes per queued message. The hotkey keeps using your saved defaults. Some params, like VibeVoice 1.5B reference_audio_path, expect a real local file path.</p>
+          </div>
+        </div>
+
+        <article class="result-card">
+          <h3 id="model-instructions-title">-</h3>
+          <p id="model-instructions-summary" class="muted">-</p>
+        </article>
+
+        <div class="instruction-grid">
+          <article class="result-card">
+            <h3>Supported query params</h3>
+            <div id="model-instructions-attributes" class="instruction-list">
+              <p class="muted">-</p>
+            </div>
+          </article>
+          <article class="result-card">
+            <h3>Example</h3>
+            <pre id="model-instructions-example" class="mono">-</pre>
+          </article>
+        </div>
       </section>
 
       <section class="panel">
