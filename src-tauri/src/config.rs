@@ -9,7 +9,7 @@ use std::{
 const SETTINGS_FILE: &str = "settings.json";
 const KEY_SERVICE: &str = "devvoice";
 const KEY_ACCOUNT: &str = "gemini-api-key";
-const CONFIG_VERSION: u8 = 1;
+const CONFIG_VERSION: u8 = 2;
 
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-2.5-flash";
 pub const DEFAULT_GEMINI_PROMPT: &str = "\
@@ -24,6 +24,7 @@ Rewrite the selected text for speech.\n\
 Return only the rewritten text.";
 pub const DEFAULT_SHORTCUT: &str = "Command+Control+S";
 pub const DEFAULT_HTTP_PORT: u16 = 9876;
+pub const DEFAULT_CHUNK_SIZE: usize = 250;
 
 pub fn normalize_shortcut(shortcut: &str) -> String {
     shortcut
@@ -100,6 +101,8 @@ pub struct AppConfig {
     pub voice_model: VoiceModel,
     #[serde(default)]
     pub voice_preset: String,
+    #[serde(default = "default_chunk_size")]
+    pub default_chunk_size: usize,
     #[serde(default, alias = "precision", alias = "voicePrecision")]
     pub tts_precision: TtsPrecision,
     /// Port for the local HTTP API. Set to 0 to disable.
@@ -123,6 +126,10 @@ fn default_http_port() -> u16 {
     DEFAULT_HTTP_PORT
 }
 
+fn default_chunk_size() -> usize {
+    DEFAULT_CHUNK_SIZE
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -133,6 +140,7 @@ impl Default for AppConfig {
             shortcut: DEFAULT_SHORTCUT.to_owned(),
             voice_model: VoiceModel::VibeVoiceRealtime,
             voice_preset: String::new(),
+            default_chunk_size: DEFAULT_CHUNK_SIZE,
             tts_precision: TtsPrecision::Auto,
             http_port: DEFAULT_HTTP_PORT,
         }

@@ -231,6 +231,7 @@ impl AppRuntime {
         }
         config.voice_model = input.voice_model;
         config.voice_preset = input.voice_preset;
+        config.default_chunk_size = input.default_chunk_size;
         config.tts_precision = input.tts_precision;
         if !input.shortcut.trim().is_empty() {
             config.shortcut = normalize_shortcut(&input.shortcut);
@@ -541,7 +542,8 @@ impl AppRuntime {
         }
         self.emit_snapshot(app);
 
-        let chunks = split_into_speech_chunks(&prepared_text, overrides.chunk_size);
+        let chunk_size = overrides.chunk_size.or(Some(config.default_chunk_size));
+        let chunks = split_into_speech_chunks(&prepared_text, chunk_size);
         let total = chunks.len();
         let mut first_voice: Option<String> = None;
         let mut total_audio_secs: f64 = 0.0;
@@ -837,7 +839,7 @@ fn describe_model_instructions(model: crate::config::VoiceModel) -> ModelInstruc
         ModelInstructionAttribute {
             query_param: "chunk_size".to_owned(),
             label: "Chunk size in characters".to_owned(),
-            description: "Optional. Sets the target chunk size in characters for this request. Use 0 to disable chunking entirely.".to_owned(),
+            description: "Optional. Sets the target chunk size in characters for this request. If omitted, DevVoice uses your saved default chunk size. Use 0 to disable chunking entirely.".to_owned(),
         },
         ModelInstructionAttribute {
             query_param: "save_audio".to_owned(),

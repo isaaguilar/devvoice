@@ -1,4 +1,4 @@
-use crate::config::{TtsPrecision, VoiceModel};
+use crate::config::{DEFAULT_CHUNK_SIZE, TtsPrecision, VoiceModel};
 use crate::state::SpeechOverrides;
 use any_tts::{
     AudioSamples, DType, DeviceSelection, ModelType, ReferenceAudio, SynthesisRequest, TtsConfig,
@@ -1026,7 +1026,7 @@ fn normalize_technical_text(input: &str) -> String {
 /// `chunk_size` is measured in characters. `Some(0)` disables chunking.
 pub fn split_into_speech_chunks(text: &str, chunk_size: Option<usize>) -> Vec<String> {
     let text = text.trim();
-    let target_chunk_chars = chunk_size.unwrap_or(100);
+    let target_chunk_chars = chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
     if target_chunk_chars == 0 || text.chars().count() <= target_chunk_chars {
         return vec![text.to_owned()];
     }

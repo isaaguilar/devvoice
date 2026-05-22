@@ -38,6 +38,7 @@ pub struct SettingsInput {
     pub gemini_prompt: String,
     pub voice_model: crate::config::VoiceModel,
     pub voice_preset: String,
+    pub default_chunk_size: usize,
     pub tts_precision: crate::config::TtsPrecision,
     pub shortcut: String,
     pub api_key: Option<String>,
@@ -106,7 +107,9 @@ impl SpeechOverrides {
 }
 
 fn trim_option(value: Option<String>) -> Option<String> {
-    value.map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn deserialize_optional_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
@@ -138,8 +141,9 @@ where
                     Err(serde::de::Error::custom("expected a whole number"))
                 }
             }
-            StringOrNumber::U64(number) => usize::try_from(number)
-                .map_err(|_| serde::de::Error::custom("value is too large")),
+            StringOrNumber::U64(number) => {
+                usize::try_from(number).map_err(|_| serde::de::Error::custom("value is too large"))
+            }
         })
         .transpose()
 }

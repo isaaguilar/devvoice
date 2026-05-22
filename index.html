@@ -103,6 +103,12 @@
           </label>
 
           <label class="field">
+            <span>Default chunk size</span>
+            <input id="default-chunk-size" type="number" min="0" step="1" required />
+            <small class="field-note">Target chunk size in characters for saved app defaults. Use 0 to disable chunking and synthesize the full text in one pass.</small>
+          </label>
+
+          <label class="field">
             <span>Global hotkey</span>
             <input id="shortcut" type="text" placeholder="Command+Control+S" />
             <small class="field-note">Default hotkey: Command+Control+S.</small>

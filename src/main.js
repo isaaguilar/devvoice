@@ -28,6 +28,7 @@ const elements = {
   geminiPrompt: document.querySelector("#gemini-prompt"),
   voiceModel: document.querySelector("#voice-model"),
   voicePreset: document.querySelector("#voice-preset"),
+  defaultChunkSize: document.querySelector("#default-chunk-size"),
   shortcut: document.querySelector("#shortcut"),
   manualText: document.querySelector("#manual-text"),
   speakSelection: document.querySelector("#speak-selection"),
@@ -94,6 +95,10 @@ function currentSettingsInput() {
     geminiPrompt: requireElement(elements.geminiPrompt, "#gemini-prompt").value.trim(),
     voiceModel: requireElement(elements.voiceModel, "#voice-model").value,
     voicePreset: requireElement(elements.voicePreset, "#voice-preset").value,
+    defaultChunkSize: Number.parseInt(
+      requireElement(elements.defaultChunkSize, "#default-chunk-size").value,
+      10,
+    ),
     ttsPrecision: currentTtsPrecision,
     shortcut: requireElement(elements.shortcut, "#shortcut").value.trim(),
     apiKey: apiKey.length > 0 ? apiKey : null,
@@ -107,6 +112,9 @@ function renderSettings(snapshot) {
   requireElement(elements.geminiPrompt, "#gemini-prompt").value = snapshot.config.geminiPrompt;
   requireElement(elements.voiceModel, "#voice-model").value = snapshot.config.voiceModel;
   populateVoicePresets(snapshot.availableVoices || [], snapshot.config.voicePreset || "");
+  requireElement(elements.defaultChunkSize, "#default-chunk-size").value = String(
+    snapshot.config.defaultChunkSize,
+  );
   currentTtsPrecision = snapshot.config.ttsPrecision || "auto";
   requireElement(elements.shortcut, "#shortcut").value = snapshot.config.shortcut;
   apiKeyInput.placeholder = snapshot.apiKeyPresent
@@ -233,6 +241,9 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (!form.reportValidity()) {
+      return;
+    }
     setBusy(true);
     try {
       const snapshot = await invoke("save_settings", { input: currentSettingsInput() });
@@ -245,6 +256,9 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   requireElement(elements.voiceModel, "#voice-model").addEventListener("change", async () => {
     clearVoicePresets();
+    if (!form.reportValidity()) {
+      return;
+    }
     setBusy(true);
     try {
       const snapshot = await invoke("save_settings", { input: currentSettingsInput() });

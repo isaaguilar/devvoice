@@ -1,6 +1,6 @@
 [package]
 name = "devvoice-desktop"
-version = "0.1.21"
+version = "0.1.23"
 description = "DevVoice desktop app"
 authors = ["you"]
 edition = "2021"

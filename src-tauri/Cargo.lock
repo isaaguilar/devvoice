@@ -1584,7 +1584,7 @@ dependencies = [
 
 [[package]]
 name = "devvoice-desktop"
-version = "0.1.21"
+version = "0.1.23"
 dependencies = [
  "any-tts",
  "anyhow",
