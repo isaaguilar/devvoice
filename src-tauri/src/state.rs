@@ -27,6 +27,8 @@ pub struct AppSnapshot {
     pub last_prepared_text: Option<String>,
     pub last_error: Option<String>,
     pub available_voices: Vec<String>,
+    pub tts_runtime_label: Option<String>,
+    pub tts_backend_status: String,
     pub model_instructions: ModelInstructions,
 }
 
@@ -53,6 +55,14 @@ pub struct SpeechOverrides {
     pub style: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default, alias = "referencePresetId", alias = "reference_preset_id")]
+    pub reference_preset_id: Option<String>,
+    #[serde(
+        default,
+        alias = "referencePresetName",
+        alias = "reference_preset_name"
+    )]
+    pub reference_preset_name: Option<String>,
     #[serde(default, alias = "referenceAudioPath", alias = "reference_audio_path")]
     pub reference_audio_path: Option<String>,
     #[serde(
@@ -95,6 +105,8 @@ impl SpeechOverrides {
             voice_preset: trim_option(self.voice_preset),
             style: trim_option(self.style),
             description: trim_option(self.description),
+            reference_preset_id: trim_option(self.reference_preset_id),
+            reference_preset_name: trim_option(self.reference_preset_name),
             reference_audio_path: trim_option(self.reference_audio_path),
             cfg_scale: self.cfg_scale,
             temperature: self.temperature,

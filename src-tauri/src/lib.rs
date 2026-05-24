@@ -4,14 +4,17 @@ mod http_api;
 mod state;
 mod tts;
 
-use crate::config::{AppConfig, ConfigStore, normalize_shortcut};
+use crate::config::{normalize_shortcut, AppConfig, ConfigStore};
 use crate::gemini::GeminiProvider;
 use crate::state::{
     AppSnapshot, AppStatus, ModelInstructionAttribute, ModelInstructions, SettingsInput,
     SpeakOutcome, SpeechOverrides,
 };
-use crate::tts::{PlaybackController, TtsService, initialize_tracing, log_file_path, split_into_speech_chunks};
-use anyhow::{Context, Result, anyhow};
+use crate::tts::{
+    initialize_tracing, log_file_path, split_into_speech_chunks, PlaybackController, TtsService,
+    VibeVoicePresetInfo, WarmupInfo,
+};
+use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use std::collections::VecDeque;
 use std::fs;
@@ -22,7 +25,7 @@ use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, State, image::Image};
+use tauri::{image::Image, AppHandle, Emitter, Manager, State};
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -151,35 +154,62 @@ impl AppRuntime {
         let (queue_tx, queue_rx) = mpsc::unbounded_channel();
         let speech_queue = SpeechQueue::new(queue_tx);
 
-        Ok((Self {
-            store,
-            config: RwLock::new(config),
-            runtime: Mutex::new(RuntimeState::default()),
-            client,
-            tts,
-            playback,
-            speech_queue,
-        }, queue_rx))
+        Ok((
+            Self {
+                store,
+                config: RwLock::new(config),
+                runtime: Mutex::new(RuntimeState::default()),
+                client,
+                tts,
+                playback,
+                speech_queue,
+            },
+            queue_rx,
+        ))
     }
 
     pub fn snapshot(&self) -> AppSnapshot {
         let config = self.config.read().unwrap().clone();
         let runtime = self.runtime.lock().unwrap();
         let model_instructions = describe_model_instructions(config.voice_model);
+        let tts_runtime_label = self
+            .tts
+            .loaded_runtime_label(config.voice_model, config.tts_precision);
+        let tts_backend_status = self
+            .tts
+            .backend_status(config.voice_model, config.tts_precision);
 
         AppSnapshot {
             status: runtime.status,
             status_detail: runtime.status_detail.clone(),
             config,
-            api_key_present: self.store.read_api_key().map(|key| key.is_some()).unwrap_or(false),
+            api_key_present: self
+                .store
+                .read_api_key()
+                .map(|key| key.is_some())
+                .unwrap_or(false),
             model_ready: runtime.model_ready,
             playback_paused: runtime.playback_paused,
             last_selection: runtime.last_selection.clone(),
             last_prepared_text: runtime.last_prepared_text.clone(),
             last_error: runtime.last_error.clone(),
             available_voices: runtime.available_voices.clone(),
+            tts_runtime_label,
+            tts_backend_status,
             model_instructions,
         }
+    }
+
+    pub fn current_runtime_label(&self) -> Option<String> {
+        let config = self.current_config();
+        self.tts
+            .loaded_runtime_label(config.voice_model, config.tts_precision)
+    }
+
+    pub fn current_backend_status(&self) -> String {
+        let config = self.current_config();
+        self.tts
+            .backend_status(config.voice_model, config.tts_precision)
     }
 
     fn emit_snapshot(&self, app: &AppHandle) {
@@ -221,6 +251,8 @@ impl AppRuntime {
     pub fn save_settings(&self, app: &AppHandle, input: SettingsInput) -> Result<AppSnapshot> {
         let mut config = self.current_config();
         let old_shortcut = config.shortcut.clone();
+        let old_voice_model = config.voice_model;
+        let old_precision = config.tts_precision;
 
         config.gemini_enabled = input.gemini_enabled;
         if !input.gemini_model.trim().is_empty() {
@@ -233,6 +265,9 @@ impl AppRuntime {
         config.voice_preset = input.voice_preset;
         config.default_chunk_size = input.default_chunk_size;
         config.tts_precision = input.tts_precision;
+        if config.voice_model == crate::config::VoiceModel::VibeVoice {
+            config.tts_precision = crate::config::TtsPrecision::Auto;
+        }
         if !input.shortcut.trim().is_empty() {
             config.shortcut = normalize_shortcut(&input.shortcut);
         }
@@ -255,27 +290,40 @@ impl AppRuntime {
             let mut guard = self.config.write().unwrap();
             *guard = config.clone();
         }
-        self.tts.prune_cache(config.voice_model, config.tts_precision);
+        if old_voice_model != config.voice_model || old_precision != config.tts_precision {
+            self.tts.reset_auto_precision_override(config.voice_model);
+        }
+        self.tts
+            .prune_cache(config.voice_model, config.tts_precision);
 
         if old_shortcut != config.shortcut {
             self.rebind_shortcut(app)?;
         }
 
         info!("Settings saved. {api_key_status}");
-        self.mark_status(app, AppStatus::Ready, format!("Settings saved. {api_key_status}"));
+        self.mark_status(
+            app,
+            AppStatus::Ready,
+            format!("Settings saved. {api_key_status}"),
+        );
         Ok(self.snapshot())
     }
 
     pub async fn warmup_model(&self, app: &AppHandle) -> Result<()> {
         let config = self.current_config();
-        self.tts.prune_cache(config.voice_model, config.tts_precision);
+        self.tts
+            .prune_cache(config.voice_model, config.tts_precision);
         self.mark_status(
             app,
             AppStatus::LoadingModel,
-            "Downloading and warming the TTS model on Metal...",
+            "Downloading and warming the TTS model...",
         );
 
-        match self.tts.warmup(config.voice_model, config.tts_precision).await {
+        match self
+            .tts
+            .warmup(config.voice_model, config.tts_precision)
+            .await
+        {
             Ok(warmup) => {
                 {
                     let mut runtime = self.runtime.lock().unwrap();
@@ -285,11 +333,20 @@ impl AppRuntime {
                 self.mark_status(
                     app,
                     AppStatus::Ready,
-                    format!(
-                        "Model ready with {} voice presets on {}.",
-                        warmup.voices.len(),
-                        warmup.runtime_label
-                    ),
+                    if warmup.warmed_inference {
+                        format!(
+                            "Model ready with {} voice presets on {} after inference warmup ({} ms).",
+                            warmup.voices.len(),
+                            warmup.runtime_label,
+                            warmup.warmup_duration_ms
+                        )
+                    } else {
+                        format!(
+                            "Model ready with {} voice presets on {}.",
+                            warmup.voices.len(),
+                            warmup.runtime_label
+                        )
+                    },
                 );
                 Ok(())
             }
@@ -304,7 +361,10 @@ impl AppRuntime {
         let runtime = self.runtime.lock().unwrap();
         matches!(
             runtime.status,
-            AppStatus::Speaking | AppStatus::Synthesizing | AppStatus::RewritingText | AppStatus::CapturingSelection
+            AppStatus::Speaking
+                | AppStatus::Synthesizing
+                | AppStatus::RewritingText
+                | AppStatus::CapturingSelection
         )
     }
 
@@ -336,8 +396,13 @@ impl AppRuntime {
     pub async fn speak_manual_text(&self, app: &AppHandle, text: String) -> Result<SpeakOutcome> {
         self.speech_queue.clear_and_invalidate();
         let job = self.playback.begin_job()?;
-        self.process_text(app, text, SpeechMode::Direct(job), SpeechOverrides::default())
-            .await
+        self.process_text(
+            app,
+            text,
+            SpeechMode::Direct(job),
+            SpeechOverrides::default(),
+        )
+        .await
     }
 
     pub async fn enqueue_selection(&self, app: &AppHandle) -> Result<usize> {
@@ -378,10 +443,9 @@ impl AppRuntime {
         let overrides = overrides.normalized();
         self.validate_overrides(&overrides)?;
 
-        let position = self.speech_queue.enqueue(QueuedSpeechRequest {
-            text,
-            overrides,
-        });
+        let position = self
+            .speech_queue
+            .enqueue(QueuedSpeechRequest { text, overrides });
         let should_mark_ready = {
             let mut runtime = self.runtime.lock().unwrap();
             runtime.playback_paused = false;
@@ -407,10 +471,19 @@ impl AppRuntime {
     }
 
     fn validate_overrides(&self, overrides: &SpeechOverrides) -> Result<()> {
-        let model = self.current_config().voice_model;
+        self.validate_overrides_for_model(self.current_config().voice_model, overrides)
+    }
+
+    fn validate_overrides_for_model(
+        &self,
+        model: crate::config::VoiceModel,
+        overrides: &SpeechOverrides,
+    ) -> Result<()> {
         match model {
             crate::config::VoiceModel::VibeVoiceRealtime => {
                 if overrides.description.is_some()
+                    || overrides.reference_preset_id.is_some()
+                    || overrides.reference_preset_name.is_some()
                     || overrides.reference_audio_path.is_some()
                     || overrides.cfg_scale.is_some()
                     || overrides.temperature.is_some()
@@ -430,6 +503,19 @@ impl AppRuntime {
                         "VibeVoice 1.5B does not use voice_preset, style, or description query params. Use reference_audio_path plus speaker-formatted text instead."
                     ));
                 }
+                let reference_selector_count = [
+                    overrides.reference_audio_path.is_some(),
+                    overrides.reference_preset_id.is_some(),
+                    overrides.reference_preset_name.is_some(),
+                ]
+                .into_iter()
+                .filter(|present| *present)
+                .count();
+                if reference_selector_count > 1 {
+                    return Err(anyhow!(
+                        "Provide only one of reference_audio_path, reference_preset_id, or reference_preset_name for VibeVoice 1.5B."
+                    ));
+                }
                 if let Some(path) = overrides.reference_audio_path.as_deref() {
                     if !Path::new(path).exists() {
                         return Err(anyhow!(
@@ -439,7 +525,9 @@ impl AppRuntime {
                 }
             }
             crate::config::VoiceModel::ParlerTts => {
-                if overrides.reference_audio_path.is_some()
+                if overrides.reference_preset_id.is_some()
+                    || overrides.reference_preset_name.is_some()
+                    || overrides.reference_audio_path.is_some()
                     || overrides.cfg_scale.is_some()
                     || overrides.temperature.is_some()
                     || overrides.max_tokens.is_some()
@@ -452,6 +540,8 @@ impl AppRuntime {
             crate::config::VoiceModel::Kokoro => {
                 if overrides.style.is_some()
                     || overrides.description.is_some()
+                    || overrides.reference_preset_id.is_some()
+                    || overrides.reference_preset_name.is_some()
                     || overrides.reference_audio_path.is_some()
                     || overrides.cfg_scale.is_some()
                     || overrides.temperature.is_some()
@@ -465,6 +555,55 @@ impl AppRuntime {
         }
 
         Ok(())
+    }
+
+    pub fn create_vibevoice_preset(
+        &self,
+        reference_audio_path: &str,
+        name: Option<&str>,
+    ) -> Result<VibeVoicePresetInfo> {
+        self.tts.create_vibevoice_preset(reference_audio_path, name)
+    }
+
+    pub fn list_vibevoice_presets(&self) -> Result<Vec<VibeVoicePresetInfo>> {
+        self.tts.list_vibevoice_presets()
+    }
+
+    pub async fn warmup_vibevoice(
+        &self,
+        app: &AppHandle,
+        overrides: SpeechOverrides,
+    ) -> Result<WarmupInfo> {
+        let overrides = overrides.normalized();
+        self.validate_overrides_for_model(crate::config::VoiceModel::VibeVoice, &overrides)?;
+        self.mark_status(
+            app,
+            AppStatus::LoadingModel,
+            "Running VibeVoice 1.5B inference warmup...",
+        );
+        let precision = self.current_config().tts_precision;
+        match self.tts.warmup_vibevoice(precision, &overrides).await {
+            Ok(warmup) => {
+                if self.current_config().voice_model == crate::config::VoiceModel::VibeVoice {
+                    let mut runtime = self.runtime.lock().unwrap();
+                    runtime.model_ready = true;
+                    runtime.available_voices = warmup.voices.clone();
+                }
+                self.mark_status(
+                    app,
+                    AppStatus::Ready,
+                    format!(
+                        "VibeVoice 1.5B warmup finished on {} in {} ms.",
+                        warmup.runtime_label, warmup.warmup_duration_ms
+                    ),
+                );
+                Ok(warmup)
+            }
+            Err(error) => {
+                self.mark_error(app, error.to_string());
+                Err(error)
+            }
+        }
     }
 
     pub fn skip_current_item(&self, app: &AppHandle) -> Result<AppSnapshot> {
@@ -495,7 +634,8 @@ impl AppRuntime {
             is_double
         };
 
-        let playback_active = !self.playback.is_empty() || self.is_active() || self.speech_queue.len() > 0;
+        let playback_active =
+            !self.playback.is_empty() || self.is_active() || self.speech_queue.len() > 0;
         if double_press && playback_active {
             self.skip_current_item(app)?;
         } else {
@@ -527,14 +667,14 @@ impl AppRuntime {
         self.emit_snapshot(app);
 
         let config = self.current_config();
-        let (prepared_text, used_gemini) = match self.prepare_text(app, &raw_selection, &config).await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                self.mark_error(app, error.to_string());
-                return Err(error);
-            }
-        };
+        let (prepared_text, used_gemini) =
+            match self.prepare_text(app, &raw_selection, &config).await {
+                Ok(result) => result,
+                Err(error) => {
+                    self.mark_error(app, error.to_string());
+                    return Err(error);
+                }
+            };
 
         {
             let mut runtime = self.runtime.lock().unwrap();
@@ -548,7 +688,8 @@ impl AppRuntime {
         let mut first_voice: Option<String> = None;
         let mut total_audio_secs: f64 = 0.0;
         let mut synthesized_chunks = Vec::with_capacity(total);
-        let should_save_audio = overrides.save_audio.unwrap_or(false) || overrides.output_dir.is_some();
+        let should_save_audio =
+            overrides.save_audio.unwrap_or(false) || overrides.output_dir.is_some();
         let mut completed = true;
 
         for (i, chunk) in chunks.into_iter().enumerate() {
@@ -586,12 +727,12 @@ impl AppRuntime {
                 )
                 .await
             {
-                    Ok(result) => result,
-                    Err(error) => {
-                        self.mark_error(app, format!("{error:#}"));
-                        return Err(error);
-                    }
-                };
+                Ok(result) => result,
+                Err(error) => {
+                    self.mark_error(app, format!("{error:#}"));
+                    return Err(error);
+                }
+            };
 
             if i == 0 {
                 first_voice = voice_name;
@@ -753,7 +894,9 @@ fn combine_audio_chunks(chunks: &[any_tts::AudioSamples]) -> Result<any_tts::Aud
     let mut samples = Vec::new();
     for chunk in chunks {
         if chunk.sample_rate != first.sample_rate || chunk.channels != first.channels {
-            return Err(anyhow!("cannot combine synthesized chunks with mismatched audio formats"));
+            return Err(anyhow!(
+                "cannot combine synthesized chunks with mismatched audio formats"
+            ));
         }
         samples.extend_from_slice(&chunk.samples);
     }
@@ -797,6 +940,16 @@ fn describe_model_instructions(model: crate::config::VoiceModel) -> ModelInstruc
                 description: "Optional. Path to a local WAV or MP3 file used to seed speaker identity for this request. A clean 3 to 10 second clip of one person speaking works best. You can record your own voice, clip existing speech you have rights to use, or reuse another generated sample.".to_owned(),
             },
             ModelInstructionAttribute {
+                query_param: "reference_preset_id".to_owned(),
+                label: "Saved reference preset".to_owned(),
+                description: "Optional. Reuses a VibeVoice preset created earlier from a reference clip, so /speak can skip rebuilding that voice seed from raw audio on every request.".to_owned(),
+            },
+            ModelInstructionAttribute {
+                query_param: "reference_preset_name".to_owned(),
+                label: "Saved reference preset by name".to_owned(),
+                description: "Optional. Looks up a VibeVoice preset by its unique creation name instead of by preset ID.".to_owned(),
+            },
+            ModelInstructionAttribute {
                 query_param: "cfg_scale".to_owned(),
                 label: "Guidance scale".to_owned(),
                 description: "Overrides the VibeVoice classifier-free guidance scale for this request. Default is 1.3.".to_owned(),
@@ -809,7 +962,7 @@ fn describe_model_instructions(model: crate::config::VoiceModel) -> ModelInstruc
             ModelInstructionAttribute {
                 query_param: "max_tokens".to_owned(),
                 label: "Generation budget".to_owned(),
-                description: "Caps how many generation tokens VibeVoice can spend on this request. Lower values finish faster.".to_owned(),
+                description: "Caps how many generation tokens VibeVoice can spend on this request. Cost scales steeply, so 32 is a better starting point for short utterances and you should only increase it when outputs are being cut off.".to_owned(),
             },
         ],
         crate::config::VoiceModel::ParlerTts => vec![
@@ -858,7 +1011,7 @@ fn describe_model_instructions(model: crate::config::VoiceModel) -> ModelInstruc
             "Fastest local model. Use voice_preset and style for delivery changes. You can also control chunking and optionally save the synthesized WAV per request."
         }
         crate::config::VoiceModel::VibeVoice => {
-            "Long-form expressive model. Use Speaker 0:, Speaker 1:, and similar labels directly in the request body for dialogue. reference_audio_path is optional and lets you steer voice identity from a real local WAV or MP3 clip instead of a named preset. You can also control chunking and optionally save the synthesized WAV per request."
+            "Long-form expressive model. DevVoice now runs VibeVoice 1.5B through the MLX backend on macOS, using auto precision only. The app warms the model automatically on startup, and you can also call /vibevoice/warmup to preload a saved preset before a real request. Use Speaker 0:, Speaker 1:, and similar labels directly in the request body for dialogue. You can seed voice identity with a raw reference_audio_path, a reusable reference_preset_id, or a unique reference_preset_name created ahead of time. You can also control chunking and optionally save the synthesized WAV per request."
         }
         crate::config::VoiceModel::ParlerTts => {
             "Most flexible model for descriptive voice control. You can override the preset, send a full description, or append a style suffix per request."
@@ -873,11 +1026,23 @@ fn describe_model_instructions(model: crate::config::VoiceModel) -> ModelInstruc
             r#"curl -X POST "http://127.0.0.1:9876/speak?voice_preset=en-Emma_woman&style=Read%20this%20like%20an%20excited%20demo%20for%20engineers.&chunk_size=0&save_audio=true" --data "Ship the build after the tests pass.""#
         }
         crate::config::VoiceModel::VibeVoice => {
-            "No seed voice, use the model default:\n\
-curl -X POST \"http://127.0.0.1:9876/speak?cfg_scale=1.3&temperature=0.0&max_tokens=96&chunk_size=220\" --data-binary $'Speaker 0: Explain the rollout calmly.\\nSpeaker 1: Reply with more excitement.'\n\
+            "Create a reusable preset once, using a unique name:\n\
+curl -X POST \"http://127.0.0.1:9876/vibevoice/presets\" -H \"Content-Type: application/json\" -d '{\"name\":\"my-demo-voice\",\"referenceAudioPath\":\"/Users/you/Desktop/reference-voice.wav\"}'\n\
+\n\
+Warm the 1.5B model and that preset before your first real request:\n\
+curl -X POST \"http://127.0.0.1:9876/vibevoice/warmup\" -H \"Content-Type: application/json\" -d '{\"referencePresetName\":\"my-demo-voice\"}'\n\
+\n\
+Reuse a saved preset by unique name for synthesis:\n\
+curl -X POST \"http://127.0.0.1:9876/speak?reference_preset_name=my-demo-voice&cfg_scale=1.3&temperature=0.0&max_tokens=32\" --data-binary $'Speaker 0: Explain the rollout calmly.\\nSpeaker 1: Reply with more excitement.'\n\
+\n\
+Or reuse a saved preset by internal id:\n\
+curl -X POST \"http://127.0.0.1:9876/speak?reference_preset_id=my-demo-voice-1716420000&cfg_scale=1.3&temperature=0.0&max_tokens=32\" --data-binary $'Speaker 0: Explain the rollout calmly.\\nSpeaker 1: Reply with more excitement.'\n\
+\n\
+No seed voice, use the model default:\n\
+curl -X POST \"http://127.0.0.1:9876/speak?cfg_scale=1.3&temperature=0.0&max_tokens=32&chunk_size=220\" --data-binary $'Speaker 0: Explain the rollout calmly.\\nSpeaker 1: Reply with more excitement.'\n\
 \n\
 Optional seed voice, replace the path with a real local file:\n\
-curl -X POST \"http://127.0.0.1:9876/speak?reference_audio_path=/Users/you/Desktop/reference-voice.wav&cfg_scale=1.3&temperature=0.0&max_tokens=96&save_audio=true\" --data-binary $'Speaker 0: Explain the rollout calmly.\\nSpeaker 1: Reply with more excitement.'"
+curl -X POST \"http://127.0.0.1:9876/speak?reference_audio_path=/Users/you/Desktop/reference-voice.wav&cfg_scale=1.3&temperature=0.0&max_tokens=32&save_audio=true\" --data-binary $'Speaker 0: Explain the rollout calmly.\\nSpeaker 1: Reply with more excitement.'"
         }
         crate::config::VoiceModel::ParlerTts => {
             r#"curl -X POST "http://127.0.0.1:9876/speak?voice_preset=senior_developer&style=Sound%20more%20enthusiastic%20without%20rushing." --data "Explain the rollout plan.""#
@@ -940,7 +1105,13 @@ fn open_log_file_inner() -> Result<()> {
 
 fn build_tray(app: &AppHandle) -> Result<()> {
     let show = MenuItem::with_id(app, "show", "Show DevVoice", true, None::<&str>)?;
-    let speak = MenuItem::with_id(app, "speak-selection", "Speak Selection", true, None::<&str>)?;
+    let speak = MenuItem::with_id(
+        app,
+        "speak-selection",
+        "Speak Selection",
+        true,
+        None::<&str>,
+    )?;
     let pause = MenuItem::with_id(app, "pause", "Pause/Resume", true, None::<&str>)?;
     let stop = MenuItem::with_id(app, "stop", "Stop", true, None::<&str>)?;
     let open_log = MenuItem::with_id(app, "open-log", "Open Log File", true, None::<&str>)?;
@@ -1098,7 +1269,9 @@ async fn save_settings(
 ) -> Result<AppSnapshot, String> {
     let old_model = state.current_config().voice_model;
     let old_precision = state.current_config().tts_precision;
-    let snapshot = state.save_settings(&app, input).map_err(|error| error.to_string())?;
+    let snapshot = state
+        .save_settings(&app, input)
+        .map_err(|error| error.to_string())?;
 
     if snapshot.config.voice_model != old_model || snapshot.config.tts_precision != old_precision {
         let app_clone = app.clone();
@@ -1223,7 +1396,9 @@ async fn queue_worker(app: AppHandle, mut rx: mpsc::UnboundedReceiver<QueueSigna
             let request = match runtime.speech_queue.pop() {
                 Some(request) => request,
                 None => {
-                    tracing::info!("queue_worker: queue empty, inner loop done (played {items_played} items)");
+                    tracing::info!(
+                        "queue_worker: queue empty, inner loop done (played {items_played} items)"
+                    );
                     break;
                 }
             };
@@ -1251,7 +1426,11 @@ async fn queue_worker(app: AppHandle, mut rx: mpsc::UnboundedReceiver<QueueSigna
                 .await
             {
                 Ok(outcome) => {
-                    tracing::info!("queue_worker: item {} done, audio={:.1}s", items_played + 1, outcome.audio_duration_secs);
+                    tracing::info!(
+                        "queue_worker: item {} done, audio={:.1}s",
+                        items_played + 1,
+                        outcome.audio_duration_secs
+                    );
                 }
                 Err(e) => {
                     tracing::error!("queue worker: speech failed: {e:#}");
@@ -1280,7 +1459,10 @@ async fn queue_worker(app: AppHandle, mut rx: mpsc::UnboundedReceiver<QueueSigna
             }
         }
 
-        if runtime.speech_queue.generation() == queue_gen && items_played > 0 && runtime.playback.is_empty() {
+        if runtime.speech_queue.generation() == queue_gen
+            && items_played > 0
+            && runtime.playback.is_empty()
+        {
             tracing::info!("queue_worker: batch complete ({items_played} items)");
             runtime.mark_status(&app, AppStatus::Ready, "Queue complete.");
         }

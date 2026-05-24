@@ -19,6 +19,7 @@ const elements = {
   configPath: document.querySelector("#config-path"),
   logPath: document.querySelector("#log-path"),
   httpApiLabel: document.querySelector("#http-api-label"),
+  ttsBackendLabel: document.querySelector("#tts-backend-label"),
   apiKeyState: document.querySelector("#api-key-state"),
   settingsForm: document.querySelector("#settings-form"),
   saveSettings: document.querySelector("#save-settings"),
@@ -28,6 +29,8 @@ const elements = {
   geminiPrompt: document.querySelector("#gemini-prompt"),
   voiceModel: document.querySelector("#voice-model"),
   voicePreset: document.querySelector("#voice-preset"),
+  ttsPrecision: document.querySelector("#tts-precision"),
+  ttsPrecisionNote: document.querySelector("#tts-precision-note"),
   defaultChunkSize: document.querySelector("#default-chunk-size"),
   shortcut: document.querySelector("#shortcut"),
   manualText: document.querySelector("#manual-text"),
@@ -48,8 +51,6 @@ const elements = {
 
 let configPath = "-";
 let logPath = "-";
-let currentTtsPrecision = "auto";
-
 function requireElement(element, selector) {
   if (!element) {
     throw new Error(`Missing required element: ${selector}`);
@@ -95,14 +96,31 @@ function currentSettingsInput() {
     geminiPrompt: requireElement(elements.geminiPrompt, "#gemini-prompt").value.trim(),
     voiceModel: requireElement(elements.voiceModel, "#voice-model").value,
     voicePreset: requireElement(elements.voicePreset, "#voice-preset").value,
+    ttsPrecision: requireElement(elements.ttsPrecision, "#tts-precision").value,
     defaultChunkSize: Number.parseInt(
       requireElement(elements.defaultChunkSize, "#default-chunk-size").value,
       10,
     ),
-    ttsPrecision: currentTtsPrecision,
     shortcut: requireElement(elements.shortcut, "#shortcut").value.trim(),
     apiKey: apiKey.length > 0 ? apiKey : null,
   };
+}
+
+function syncPrecisionControls(voiceModel, selectedPrecision) {
+  const select = elements.ttsPrecision;
+  if (!select) return;
+  const isVibeVoice = voiceModel === "vibevoice";
+  for (const option of select.options) {
+    option.disabled = isVibeVoice && option.value !== "auto";
+  }
+  if (isVibeVoice && selectedPrecision !== "auto") {
+    select.value = "auto";
+  }
+  if (elements.ttsPrecisionNote) {
+    elements.ttsPrecisionNote.textContent = isVibeVoice
+      ? "VibeVoice 1.5B now runs through the MLX backend and uses auto precision only. Other models can still use the Rust precision options."
+      : "Auto preserves the current fast 0.5B behavior. Non-VibeVoice models can still use F16, BF16, or F32.";
+  }
 }
 
 function renderSettings(snapshot) {
@@ -112,10 +130,11 @@ function renderSettings(snapshot) {
   requireElement(elements.geminiPrompt, "#gemini-prompt").value = snapshot.config.geminiPrompt;
   requireElement(elements.voiceModel, "#voice-model").value = snapshot.config.voiceModel;
   populateVoicePresets(snapshot.availableVoices || [], snapshot.config.voicePreset || "");
+  requireElement(elements.ttsPrecision, "#tts-precision").value = snapshot.config.ttsPrecision || "auto";
+  syncPrecisionControls(snapshot.config.voiceModel, snapshot.config.ttsPrecision || "auto");
   requireElement(elements.defaultChunkSize, "#default-chunk-size").value = String(
     snapshot.config.defaultChunkSize,
   );
-  currentTtsPrecision = snapshot.config.ttsPrecision || "auto";
   requireElement(elements.shortcut, "#shortcut").value = snapshot.config.shortcut;
   apiKeyInput.placeholder = snapshot.apiKeyPresent
     ? "Saved in Keychain. Leave blank to keep it."
@@ -192,6 +211,10 @@ function renderSnapshot(snapshot) {
   } else {
     setText(elements.httpApiLabel, "HTTP API: disabled");
   }
+  setText(
+    elements.ttsBackendLabel,
+    `TTS backend: ${snapshot.ttsBackendStatus || snapshot.ttsRuntimeLabel || "-"}`,
+  );
   setText(elements.lastSelection, snapshot.lastSelection || "-");
   setText(elements.lastOutput, snapshot.lastPreparedText || "-");
   setText(elements.lastError, snapshot.lastError || "-");
@@ -255,6 +278,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   requireElement(elements.voiceModel, "#voice-model").addEventListener("change", async () => {
+    syncPrecisionControls(
+      requireElement(elements.voiceModel, "#voice-model").value,
+      requireElement(elements.ttsPrecision, "#tts-precision").value,
+    );
     clearVoicePresets();
     if (!form.reportValidity()) {
       return;

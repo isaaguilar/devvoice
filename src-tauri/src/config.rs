@@ -151,6 +151,9 @@ fn migrate_config(config: &mut AppConfig) {
     if config.config_version != CONFIG_VERSION {
         config.config_version = CONFIG_VERSION;
     }
+    if config.voice_model == VoiceModel::VibeVoice {
+        config.tts_precision = TtsPrecision::Auto;
+    }
     config.shortcut = normalize_shortcut(&config.shortcut);
     if config.shortcut.trim().is_empty() {
         config.shortcut = DEFAULT_SHORTCUT.to_owned();

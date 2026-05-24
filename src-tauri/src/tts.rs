@@ -1,11 +1,12 @@
-use crate::config::{DEFAULT_CHUNK_SIZE, TtsPrecision, VoiceModel};
+use crate::config::{TtsPrecision, VoiceModel, DEFAULT_CHUNK_SIZE};
 use crate::state::SpeechOverrides;
+use any_tts::mel::resample_linear;
+use any_tts::models::vibevoice::config::VibeVoicePreprocessorConfig;
 use any_tts::{
-    AudioSamples, DType, DeviceSelection, ModelType, ReferenceAudio, SynthesisRequest, TtsConfig,
-    TtsModel,
-    load_model,
+    load_model, AudioSamples, DType, DeviceSelection, ModelType, ReferenceAudio, SynthesisRequest,
+    TtsConfig, TtsModel, VoiceEmbedding,
 };
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use candle_core::{DType as CandleDType, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
@@ -18,16 +19,20 @@ use macos_accessibility_client::accessibility::{
 use reqwest::blocking::Client as BlockingClient;
 use rodio::buffer::SamplesBuffer;
 use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::num::{NonZeroU16, NonZeroU32};
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokenizers::Tokenizer;
 use tokio::sync::OnceCell;
 use tracing::{info, warn};
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 // VibeVoice Realtime 0.5B
 const VR_OWNER: &str = "microsoft";
@@ -87,6 +92,13 @@ const VOICE_PRESET_FILES: &[&str] = &[
     "in-Samuel_man.pt",
 ];
 const STYLE_PROMPT: &str = "Read like an experienced senior software engineer presenting technical prose to another engineer. Keep terminology crisp, punctuation deliberate, and code-adjacent words precise.";
+const VIBEVOICE_WARMUP_TEXT: &str = "Speaker 0: Warm up.";
+const VIBEVOICE_MLX_MODEL_ID: &str = "gafiatulin/vibevoice-1.5b-mlx";
+const VIBEVOICE_MLX_RUNTIME_LABEL: &str = "python:mlx-int8:no-semantic";
+const VIBEVOICE_MLX_INSTALL_SPEC: &str =
+    "git+https://github.com/gafiatulin/vibevoice-mlx.git@f513aa7877e77fefa1aebe87432855c407da3b87";
+const VIBEVOICE_REFERENCE_EMBEDDING_MODEL_TYPE: &str = "vibevoice-reference-audio-v1";
+const VIBEVOICE_MLX_WORKER_SCRIPT: &str = include_str!("vibevoice_mlx_worker.py");
 
 pub struct CaptureResult {
     pub raw: String,
@@ -95,6 +107,26 @@ pub struct CaptureResult {
 pub struct WarmupInfo {
     pub voices: Vec<String>,
     pub runtime_label: String,
+    pub warmed_inference: bool,
+    pub warmup_duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeVoicePresetInfo {
+    pub id: String,
+    pub name: String,
+    pub source_audio_path: String,
+    pub clip_duration_secs: f32,
+    pub sample_rate: u32,
+    pub created_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredVibeVoicePreset {
+    #[serde(flatten)]
+    info: VibeVoicePresetInfo,
+    embedding: VoiceEmbedding,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -114,6 +146,135 @@ struct LoadedModel {
     runtime_label: String,
 }
 
+#[derive(Debug)]
+enum SynthesisFailure {
+    Prepare(anyhow::Error),
+    Runtime(anyhow::Error),
+}
+
+impl SynthesisFailure {
+    fn is_runtime(&self) -> bool {
+        matches!(self, Self::Runtime(_))
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Prepare(error) | Self::Runtime(error) => error,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CachedReferenceAudio {
+    modified_at: Option<SystemTime>,
+    audio: ReferenceAudio,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+enum VibeVoiceMlxRequest {
+    Warmup {
+        text: String,
+        cfg_scale: f64,
+        max_speech_tokens: usize,
+    },
+    Synthesize {
+        text: String,
+        reference_audio_path: Option<String>,
+        output_path: String,
+        cfg_scale: f64,
+        max_speech_tokens: usize,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VibeVoiceMlxMetrics {
+    #[serde(default)]
+    load_ms: Option<u64>,
+    #[serde(default)]
+    encode_ms: Option<u64>,
+    #[serde(default)]
+    gen_ms: Option<u64>,
+    #[serde(default)]
+    audio_seconds: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VibeVoiceMlxResponse {
+    ok: bool,
+    #[serde(default)]
+    runtime_label: Option<String>,
+    #[serde(default)]
+    metrics: Option<VibeVoiceMlxMetrics>,
+    #[serde(default)]
+    output_path: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+struct VibeVoiceMlxWorker {
+    child: Child,
+    stdin: BufWriter<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl VibeVoiceMlxWorker {
+    fn spawn(python_path: &Path, script_path: &Path) -> Result<Self> {
+        let mut child = Command::new(python_path)
+            .arg("-u")
+            .arg(script_path)
+            .arg("--model")
+            .arg(VIBEVOICE_MLX_MODEL_ID)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "start VibeVoice MLX worker with {} {}",
+                    python_path.display(),
+                    script_path.display()
+                )
+            })?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("capture stdin for VibeVoice MLX worker")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("capture stdout for VibeVoice MLX worker")?;
+        Ok(Self {
+            child,
+            stdin: BufWriter::new(stdin),
+            stdout: BufReader::new(stdout),
+        })
+    }
+
+    fn send(&mut self, request: &VibeVoiceMlxRequest) -> Result<VibeVoiceMlxResponse> {
+        let payload = serde_json::to_string(request).context("serialize VibeVoice MLX request")?;
+        writeln!(self.stdin, "{payload}").context("write request to VibeVoice MLX worker")?;
+        self.stdin
+            .flush()
+            .context("flush VibeVoice MLX worker stdin")?;
+        let mut line = String::new();
+        let bytes_read = self
+            .stdout
+            .read_line(&mut line)
+            .context("read response from VibeVoice MLX worker")?;
+        if bytes_read == 0 {
+            let status = self
+                .child
+                .try_wait()
+                .context("check VibeVoice MLX worker exit status")?;
+            bail!("VibeVoice MLX worker exited before replying: {status:?}");
+        }
+        serde_json::from_str(line.trim_end()).context("parse VibeVoice MLX worker response")
+    }
+}
+
 struct ParlerRuntime {
     model: ParlerModel,
     tokenizer: Tokenizer,
@@ -124,6 +285,11 @@ struct ParlerRuntime {
 pub struct TtsService {
     asset_root: PathBuf,
     cache: Mutex<HashMap<ModelCacheKey, Arc<OnceCell<Arc<LoadedModel>>>>>,
+    auto_precision_overrides: Mutex<HashMap<VoiceModel, TtsPrecision>>,
+    reference_audio_cache: Arc<Mutex<HashMap<PathBuf, CachedReferenceAudio>>>,
+    vibevoice_preset_cache: Arc<Mutex<HashMap<String, VoiceEmbedding>>>,
+    vibevoice_mlx_worker: Mutex<Option<VibeVoiceMlxWorker>>,
+    vibevoice_runtime_label: Mutex<Option<String>>,
 }
 
 impl TtsService {
@@ -131,7 +297,88 @@ impl TtsService {
         Self {
             asset_root,
             cache: Mutex::new(HashMap::new()),
+            auto_precision_overrides: Mutex::new(HashMap::new()),
+            reference_audio_cache: Arc::new(Mutex::new(HashMap::new())),
+            vibevoice_preset_cache: Arc::new(Mutex::new(HashMap::new())),
+            vibevoice_mlx_worker: Mutex::new(None),
+            vibevoice_runtime_label: Mutex::new(None),
         }
+    }
+
+    fn data_dir(&self) -> Result<PathBuf> {
+        self.asset_root
+            .parent()
+            .map(Path::to_path_buf)
+            .context("determine DevVoice data directory")
+    }
+
+    fn vibevoice_mlx_requested(&self, voice_model: VoiceModel, precision: TtsPrecision) -> bool {
+        voice_model == VoiceModel::VibeVoice
+            && cfg!(target_os = "macos")
+            && precision == TtsPrecision::Auto
+    }
+
+    fn vibevoice_mlx_python_path(&self) -> Option<PathBuf> {
+        if !cfg!(target_os = "macos") {
+            return None;
+        }
+        self.asset_root
+            .parent()
+            .map(|data_dir| data_dir.join("vibevoice-mlx-venv/bin/python"))
+            .filter(|path| path.is_file())
+    }
+
+    pub fn backend_status(&self, voice_model: VoiceModel, precision: TtsPrecision) -> String {
+        match voice_model {
+            VoiceModel::VibeVoice if !cfg!(target_os = "macos") => {
+                "VibeVoice 1.5B requires macOS because DevVoice only supports the MLX backend for this model."
+                    .to_owned()
+            }
+            VoiceModel::VibeVoice if precision != TtsPrecision::Auto => {
+                "VibeVoice 1.5B requires auto precision because it now runs only through the MLX backend."
+                    .to_owned()
+            }
+            VoiceModel::VibeVoice => {
+                if let Some(runtime_label) = self.vibevoice_runtime_label.lock().unwrap().clone() {
+                    format!("MLX ready on {runtime_label}")
+                } else if self.vibevoice_mlx_python_path().is_some() {
+                    "MLX installed, waiting for warmup.".to_owned()
+                } else {
+                    "MLX runtime missing. DevVoice will provision it automatically on first 1.5B use."
+                        .to_owned()
+                }
+            }
+            _ => self
+                .loaded_runtime_label(voice_model, precision)
+                .map(|runtime_label| format!("Built-in backend ready on {runtime_label}"))
+                .unwrap_or_else(|| format!("{} uses the built-in Rust backend.", voice_model.display_name())),
+        }
+    }
+
+    async fn ensure_vibevoice_mlx_runtime(&self, precision: TtsPrecision) -> Result<()> {
+        if !cfg!(target_os = "macos") {
+            bail!(
+                "VibeVoice 1.5B now requires macOS because DevVoice only supports the MLX backend for this model."
+            );
+        }
+        if precision != TtsPrecision::Auto {
+            bail!(
+                "VibeVoice 1.5B now requires auto precision because it runs only through the MLX backend."
+            );
+        }
+        if self.vibevoice_mlx_python_path().is_some() {
+            return Ok(());
+        }
+        let data_dir = self.data_dir()?;
+        tokio::task::spawn_blocking(move || provision_vibevoice_mlx_runtime(&data_dir))
+            .await
+            .context("join MLX runtime provisioning task")??;
+        if self.vibevoice_mlx_python_path().is_none() {
+            bail!(
+                "VibeVoice MLX provisioning completed, but the Python runtime was still not found."
+            );
+        }
+        Ok(())
     }
 
     pub async fn warmup(
@@ -139,11 +386,216 @@ impl TtsService {
         voice_model: VoiceModel,
         precision: TtsPrecision,
     ) -> Result<WarmupInfo> {
+        if voice_model == VoiceModel::VibeVoice {
+            return self
+                .warmup_vibevoice(precision, &SpeechOverrides::default())
+                .await;
+        }
+        let warmup_started = Instant::now();
         let loaded = self.ensure_loaded(voice_model, precision).await?;
         Ok(WarmupInfo {
             voices: loaded.voices.iter().cloned().collect(),
             runtime_label: loaded.runtime_label.clone(),
+            warmed_inference: false,
+            warmup_duration_ms: warmup_started.elapsed().as_millis() as u64,
         })
+    }
+
+    pub async fn warmup_vibevoice(
+        &self,
+        precision: TtsPrecision,
+        overrides: &SpeechOverrides,
+    ) -> Result<WarmupInfo> {
+        let _ = overrides;
+        self.ensure_vibevoice_mlx_runtime(precision).await?;
+        self.warmup_vibevoice_mlx().await
+    }
+
+    async fn warmup_vibevoice_mlx(&self) -> Result<WarmupInfo> {
+        let warmup_started = Instant::now();
+        let response = self.send_vibevoice_mlx_request(VibeVoiceMlxRequest::Warmup {
+            text: VIBEVOICE_WARMUP_TEXT.to_owned(),
+            cfg_scale: 1.3,
+            max_speech_tokens: 32,
+        })?;
+        let runtime_label = response
+            .runtime_label
+            .clone()
+            .unwrap_or_else(|| VIBEVOICE_MLX_RUNTIME_LABEL.to_owned());
+        *self.vibevoice_runtime_label.lock().unwrap() = Some(runtime_label.clone());
+        let warmup_duration_ms = warmup_started.elapsed().as_millis() as u64;
+        if let Some(metrics) = response.metrics.as_ref() {
+            info!(
+                "Completed VibeVoice MLX warmup in {} ms (load={:?} encode={:?} gen={:?}).",
+                warmup_duration_ms, metrics.load_ms, metrics.encode_ms, metrics.gen_ms
+            );
+        } else {
+            info!(
+                "Completed VibeVoice MLX warmup in {} ms.",
+                warmup_duration_ms
+            );
+        }
+        Ok(WarmupInfo {
+            voices: vec!["Speaker 0".to_owned()],
+            runtime_label,
+            warmed_inference: true,
+            warmup_duration_ms,
+        })
+    }
+
+    async fn synthesize_with_vibevoice_mlx(
+        &self,
+        spoken_text: &str,
+        overrides: &SpeechOverrides,
+    ) -> Result<(AudioSamples, Option<String>)> {
+        let request_started = Instant::now();
+        let reference_audio_path = self
+            .resolve_vibevoice_reference_audio_source(overrides)?
+            .map(|path| path.to_string_lossy().to_string());
+        let output_dir = self.asset_root.join("mlx-output");
+        fs::create_dir_all(&output_dir)
+            .with_context(|| format!("create MLX output directory at {}", output_dir.display()))?;
+        let output_path = output_dir.join(format!(
+            "vibevoice-mlx-{}.wav",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let max_speech_tokens = vibevoice_effective_max_tokens(spoken_text, overrides.max_tokens);
+        let response = self.send_vibevoice_mlx_request(VibeVoiceMlxRequest::Synthesize {
+            text: spoken_text.to_owned(),
+            reference_audio_path,
+            output_path: output_path.to_string_lossy().to_string(),
+            cfg_scale: overrides.cfg_scale.unwrap_or(1.3),
+            max_speech_tokens,
+        })?;
+        let runtime_label = response
+            .runtime_label
+            .clone()
+            .unwrap_or_else(|| VIBEVOICE_MLX_RUNTIME_LABEL.to_owned());
+        *self.vibevoice_runtime_label.lock().unwrap() = Some(runtime_label.clone());
+        if let Some(metrics) = response.metrics.as_ref() {
+            info!(
+                "VibeVoice MLX synthesized in {} ms (load={:?} encode={:?} gen={:?} audio_seconds={:?}) on {}.",
+                request_started.elapsed().as_millis(),
+                metrics.load_ms,
+                metrics.encode_ms,
+                metrics.gen_ms,
+                metrics.audio_seconds,
+                runtime_label
+            );
+        }
+        let returned_output_path = response
+            .output_path
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or(output_path.clone());
+        let audio = AudioSamples::from_wav_file(&returned_output_path).with_context(|| {
+            format!(
+                "load MLX-generated VibeVoice audio from {}",
+                returned_output_path.display()
+            )
+        })?;
+        if let Err(error) = fs::remove_file(&returned_output_path) {
+            warn!(
+                "Failed to remove temporary MLX audio {}: {error}",
+                returned_output_path.display()
+            );
+        }
+        Ok((audio, None))
+    }
+
+    fn resolve_vibevoice_reference_audio_source(
+        &self,
+        overrides: &SpeechOverrides,
+    ) -> Result<Option<PathBuf>> {
+        if let Some(path) = overrides
+            .reference_audio_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(Some(
+                fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path)),
+            ));
+        }
+        if let Some(preset_id) = overrides
+            .reference_preset_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return self
+                .load_vibevoice_preset_info_by_id(preset_id)
+                .map(|preset| Some(PathBuf::from(preset.source_audio_path)));
+        }
+        if let Some(preset_name) = overrides
+            .reference_preset_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return self
+                .load_vibevoice_preset_info_by_name(preset_name)
+                .map(|preset| Some(PathBuf::from(preset.source_audio_path)));
+        }
+        Ok(None)
+    }
+
+    fn send_vibevoice_mlx_request(
+        &self,
+        request: VibeVoiceMlxRequest,
+    ) -> Result<VibeVoiceMlxResponse> {
+        let python_path = self.vibevoice_mlx_python_path().ok_or_else(|| {
+            anyhow!("VibeVoice MLX is unavailable because the Python runtime was not found.")
+        })?;
+        let script_path = self.ensure_vibevoice_mlx_worker_script()?;
+        let mut worker_guard = self.vibevoice_mlx_worker.lock().unwrap();
+        if worker_guard.is_none() {
+            *worker_guard = Some(VibeVoiceMlxWorker::spawn(&python_path, &script_path)?);
+        }
+        let response = match worker_guard
+            .as_mut()
+            .context("VibeVoice MLX worker failed to initialize")?
+            .send(&request)
+        {
+            Ok(response) => response,
+            Err(first_error) => {
+                warn!("Restarting VibeVoice MLX worker after error: {first_error:#}");
+                *worker_guard = Some(VibeVoiceMlxWorker::spawn(&python_path, &script_path)?);
+                worker_guard
+                    .as_mut()
+                    .context("VibeVoice MLX worker failed to restart")?
+                    .send(&request)?
+            }
+        };
+        if !response.ok {
+            bail!(
+                "VibeVoice MLX worker error: {}",
+                response.error.as_deref().unwrap_or("unknown worker error")
+            );
+        }
+        Ok(response)
+    }
+
+    fn ensure_vibevoice_mlx_worker_script(&self) -> Result<PathBuf> {
+        let data_dir = self
+            .asset_root
+            .parent()
+            .context("determine DevVoice data directory for MLX worker")?;
+        fs::create_dir_all(data_dir)
+            .with_context(|| format!("create data directory at {}", data_dir.display()))?;
+        let script_path = data_dir.join("vibevoice-mlx-worker.py");
+        let needs_write = match fs::read_to_string(&script_path) {
+            Ok(existing) => existing != VIBEVOICE_MLX_WORKER_SCRIPT,
+            Err(_) => true,
+        };
+        if needs_write {
+            fs::write(&script_path, VIBEVOICE_MLX_WORKER_SCRIPT)
+                .with_context(|| format!("write MLX worker script to {}", script_path.display()))?;
+        }
+        Ok(script_path)
     }
 
     pub fn capture_selection(&self) -> Result<CaptureResult> {
@@ -173,40 +625,45 @@ impl TtsService {
         overrides: &SpeechOverrides,
     ) -> Result<(AudioSamples, Option<String>)> {
         let spoken_text = normalize_technical_text(text);
-        let loaded = self.ensure_loaded(voice_model, precision).await?;
-        let selected_voice = overrides.voice_preset.as_deref().unwrap_or(voice_preset);
-        let voice = resolve_voice(loaded.voices.as_ref(), selected_voice);
-        let runtime_label = loaded.runtime_label.clone();
         let overrides = overrides.clone().normalized();
+        if voice_model == VoiceModel::VibeVoice {
+            self.ensure_vibevoice_mlx_runtime(precision).await?;
+            return self
+                .synthesize_with_vibevoice_mlx(&spoken_text, &overrides)
+                .await;
+        }
+        let loaded = self.ensure_loaded(voice_model, precision).await?;
+        let initial_runtime = loaded.runtime_label.clone();
 
-        tokio::task::spawn_blocking(move || {
-            if let Some(ref voice_name) = voice {
-                info!("Using voice preset: {voice_name}");
-            } else {
-                info!("Using model default voice preset");
+        match self
+            .synthesize_with_loaded(&spoken_text, voice_model, voice_preset, &overrides, loaded)
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(error)
+                if voice_model == VoiceModel::VibeVoice
+                    && precision == TtsPrecision::Auto
+                    && initial_runtime.starts_with("metal")
+                    && error.is_runtime() =>
+            {
+                warn!(
+                    "VibeVoice 1.5B runtime failed on {initial_runtime}: {}. Falling back to CPU f32 for auto mode.",
+                    error.into_error()
+                );
+                self.force_vibevoice_auto_cpu_fallback();
+                let loaded = self.ensure_loaded(voice_model, precision).await?;
+                self.synthesize_with_loaded(
+                    &spoken_text,
+                    voice_model,
+                    voice_preset,
+                    &overrides,
+                    loaded,
+                )
+                .await
+                .map_err(SynthesisFailure::into_error)
             }
-            info!("Running {} on {runtime_label}", voice_model.display_name());
-
-            match &loaded.model {
-                LoadedModelKind::AnyTts(model) => {
-                    let request =
-                        build_request(&spoken_text, voice_model, voice.as_deref(), &overrides)?;
-                    let label = voice_model.display_name();
-                    let audio = model
-                        .synthesize(&request)
-                        .context(format!("synthesize speech with {label}"))?;
-                    Ok((audio, voice))
-                }
-                LoadedModelKind::Parler(runtime) => {
-                    let audio =
-                        synthesize_with_parler(runtime, &spoken_text, voice.as_deref(), &overrides)
-                        .context("synthesize speech with Parler-TTS")?;
-                    Ok((audio, voice))
-                }
-            }
-        })
-        .await
-        .context("wait for synthesis task")?
+            Err(error) => Err(error.into_error()),
+        }
     }
 
     pub fn prune_cache(&self, voice_model: VoiceModel, precision: TtsPrecision) {
@@ -217,18 +674,209 @@ impl TtsService {
         self.cache.lock().unwrap().retain(|key, _| *key == keep);
     }
 
+    pub fn loaded_runtime_label(
+        &self,
+        voice_model: VoiceModel,
+        precision: TtsPrecision,
+    ) -> Option<String> {
+        if self.vibevoice_mlx_requested(voice_model, precision) {
+            if let Some(runtime_label) = self.vibevoice_runtime_label.lock().unwrap().clone() {
+                return Some(runtime_label);
+            }
+        }
+        let key = ModelCacheKey {
+            voice_model,
+            precision,
+        };
+        let cell = self.cache.lock().unwrap().get(&key).cloned()?;
+        cell.get().map(|loaded| loaded.runtime_label.clone())
+    }
+
+    pub fn reset_auto_precision_override(&self, voice_model: VoiceModel) {
+        self.auto_precision_overrides
+            .lock()
+            .unwrap()
+            .remove(&voice_model);
+    }
+
+    pub fn create_vibevoice_preset(
+        &self,
+        reference_audio_path: &str,
+        name: Option<&str>,
+    ) -> Result<VibeVoicePresetInfo> {
+        let canonical_path = fs::canonicalize(reference_audio_path)
+            .unwrap_or_else(|_| PathBuf::from(reference_audio_path));
+        let source_audio = load_reference_audio_cached(
+            &self.reference_audio_cache,
+            canonical_path.to_string_lossy().as_ref(),
+        )?;
+        let preprocessor_config = load_vibevoice_preprocessor_config(&self.asset_root)?;
+        let normalized = normalize_vibevoice_reference_audio(&source_audio, &preprocessor_config);
+        let embedding = VoiceEmbedding::new(
+            normalized.clone(),
+            vec![normalized.len()],
+            VIBEVOICE_REFERENCE_EMBEDDING_MODEL_TYPE,
+        );
+        let preset_name = name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                canonical_path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| "VibeVoice preset".to_owned());
+        let preset_dir = self.ensure_vibevoice_preset_dir()?;
+        ensure_unique_vibevoice_preset_name(&preset_dir, &preset_name)?;
+        let preset_slug = slugify_preset_name(&preset_name);
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let created_at_unix_secs = created_at.as_secs();
+        let preset_id = format!("{preset_slug}-{}", created_at.as_millis());
+        let managed_audio_path = copy_vibevoice_preset_audio(
+            &canonical_path,
+            &self.ensure_vibevoice_preset_audio_dir()?,
+            &preset_id,
+        )?;
+        let preset = StoredVibeVoicePreset {
+            info: VibeVoicePresetInfo {
+                id: preset_id.clone(),
+                name: preset_name,
+                source_audio_path: managed_audio_path.to_string_lossy().to_string(),
+                clip_duration_secs: source_audio.duration_secs(),
+                sample_rate: preprocessor_config.audio_processor.sampling_rate,
+                created_at_unix_secs,
+            },
+            embedding,
+        };
+        let preset_path = vibevoice_preset_path(&preset_dir, &preset_id);
+        fs::write(
+            &preset_path,
+            serde_json::to_vec_pretty(&preset).context("serialize VibeVoice preset")?,
+        )
+        .with_context(|| format!("write VibeVoice preset {}", preset_path.display()))?;
+        self.vibevoice_preset_cache
+            .lock()
+            .unwrap()
+            .insert(preset_id, preset.embedding.clone());
+        Ok(preset.info)
+    }
+
+    pub fn list_vibevoice_presets(&self) -> Result<Vec<VibeVoicePresetInfo>> {
+        let preset_dir = self.asset_root.join("vibevoice-presets");
+        if !preset_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut presets = Vec::new();
+        for entry in fs::read_dir(&preset_dir)
+            .with_context(|| format!("read VibeVoice preset directory {}", preset_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let stored = load_stored_vibevoice_preset(&path)?;
+            presets.push(stored.info);
+        }
+        presets.sort_by(|left, right| right.created_at_unix_secs.cmp(&left.created_at_unix_secs));
+        Ok(presets)
+    }
+
+    fn load_vibevoice_preset_info_by_id(&self, preset_id: &str) -> Result<VibeVoicePresetInfo> {
+        let preset_id = validate_vibevoice_preset_id(preset_id)?;
+        let preset_path = vibevoice_preset_path(&self.ensure_vibevoice_preset_dir()?, &preset_id);
+        let stored = load_stored_vibevoice_preset(&preset_path)?;
+        Ok(stored.info)
+    }
+
+    fn load_vibevoice_preset_info_by_name(&self, preset_name: &str) -> Result<VibeVoicePresetInfo> {
+        let preset_dir = self.ensure_vibevoice_preset_dir()?;
+        let stored = find_vibevoice_preset_by_name(&preset_dir, preset_name)?;
+        Ok(stored.info)
+    }
+
+    fn load_vibevoice_preset_embedding(&self, preset_id: &str) -> Result<VoiceEmbedding> {
+        let preset_id = validate_vibevoice_preset_id(preset_id)?;
+        if let Some(embedding) = self.vibevoice_preset_cache.lock().unwrap().get(&preset_id) {
+            return Ok(embedding.clone());
+        }
+        let preset_path = vibevoice_preset_path(&self.ensure_vibevoice_preset_dir()?, &preset_id);
+        let stored = load_stored_vibevoice_preset(&preset_path)?;
+        let embedding = stored.embedding.clone();
+        self.vibevoice_preset_cache
+            .lock()
+            .unwrap()
+            .insert(preset_id, embedding.clone());
+        Ok(embedding)
+    }
+
+    fn load_vibevoice_preset_embedding_by_name(&self, preset_name: &str) -> Result<VoiceEmbedding> {
+        let preset_dir = self.ensure_vibevoice_preset_dir()?;
+        let stored = find_vibevoice_preset_by_name(&preset_dir, preset_name)?;
+        let preset_id = stored.info.id.clone();
+        let embedding = stored.embedding.clone();
+        self.vibevoice_preset_cache
+            .lock()
+            .unwrap()
+            .insert(preset_id, embedding.clone());
+        Ok(embedding)
+    }
+
+    fn ensure_vibevoice_preset_dir(&self) -> Result<PathBuf> {
+        let dir = self.asset_root.join("vibevoice-presets");
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("create VibeVoice preset directory {}", dir.display()))?;
+        Ok(dir)
+    }
+
+    fn ensure_vibevoice_preset_audio_dir(&self) -> Result<PathBuf> {
+        let dir = self.asset_root.join("vibevoice-preset-audio");
+        fs::create_dir_all(&dir).with_context(|| {
+            format!("create VibeVoice preset audio directory {}", dir.display())
+        })?;
+        Ok(dir)
+    }
+
     async fn ensure_loaded(
         &self,
         voice_model: VoiceModel,
         precision: TtsPrecision,
     ) -> Result<Arc<LoadedModel>> {
+        if voice_model == VoiceModel::VibeVoice {
+            bail!(
+                "VibeVoice 1.5B now runs only through the MLX backend. Use auto precision on macOS."
+            );
+        }
+        self.ensure_loaded_with_key(
+            ModelCacheKey {
+                voice_model,
+                precision,
+            },
+            move |asset_root| load_selected_model(asset_root, voice_model, precision),
+        )
+        .await
+    }
+
+    async fn ensure_loaded_with_key<F>(
+        &self,
+        key: ModelCacheKey,
+        loader: F,
+    ) -> Result<Arc<LoadedModel>>
+    where
+        F: FnOnce(PathBuf) -> Result<LoadedModel> + Send + 'static,
+    {
         let key = ModelCacheKey {
-            voice_model,
-            precision,
+            voice_model: key.voice_model,
+            precision: key.precision,
         };
         let cell = {
             let mut cache = self.cache.lock().unwrap();
-            cache.entry(key)
+            cache
+                .entry(key)
                 .or_insert_with(|| Arc::new(OnceCell::new()))
                 .clone()
         };
@@ -236,16 +884,111 @@ impl TtsService {
         cell.get_or_try_init(|| {
             let asset_root = self.asset_root.clone();
             async move {
-                tokio::task::spawn_blocking(move || {
-                    load_selected_model(asset_root, voice_model, precision)
-                })
-                .await
-                .context("wait for model load task")?
-                .map(Arc::new)
+                tokio::task::spawn_blocking(move || loader(asset_root))
+                    .await
+                    .context("wait for model load task")?
+                    .map(Arc::new)
             }
         })
         .await
         .map(Arc::clone)
+    }
+
+    async fn synthesize_with_loaded(
+        &self,
+        spoken_text: &str,
+        voice_model: VoiceModel,
+        voice_preset: &str,
+        overrides: &SpeechOverrides,
+        loaded: Arc<LoadedModel>,
+    ) -> std::result::Result<(AudioSamples, Option<String>), SynthesisFailure> {
+        let selected_voice = overrides.voice_preset.as_deref().unwrap_or(voice_preset);
+        let voice = resolve_voice(loaded.voices.as_ref(), selected_voice);
+        let runtime_label = loaded.runtime_label.clone();
+        let spoken_text = spoken_text.to_owned();
+        let overrides = overrides.clone();
+        let reference_audio_cache = Arc::clone(&self.reference_audio_cache);
+        let preset_embedding = if let Some(preset_id) = overrides.reference_preset_id.as_deref() {
+            Some(
+                self.load_vibevoice_preset_embedding(preset_id)
+                    .map_err(SynthesisFailure::Prepare)?,
+            )
+        } else if let Some(preset_name) = overrides.reference_preset_name.as_deref() {
+            Some(
+                self.load_vibevoice_preset_embedding_by_name(preset_name)
+                    .map_err(SynthesisFailure::Prepare)?,
+            )
+        } else {
+            None
+        };
+
+        tokio::task::spawn_blocking(move || {
+            let total_started = Instant::now();
+            if let Some(ref voice_name) = voice {
+                info!("Using voice preset: {voice_name}");
+            } else {
+                info!("Using model default voice preset");
+            }
+            info!("Running {} on {runtime_label}", voice_model.display_name());
+
+            match &loaded.model {
+                LoadedModelKind::AnyTts(model) => {
+                    let request_started = Instant::now();
+                    let request = build_request(
+                        &spoken_text,
+                        voice_model,
+                        voice.as_deref(),
+                        &overrides,
+                        &reference_audio_cache,
+                        preset_embedding.clone(),
+                    )
+                    .map_err(SynthesisFailure::Prepare)?;
+                    if voice_model == VoiceModel::VibeVoice {
+                        info!(
+                            "VibeVoice 1.5B built request in {:?} on {}.",
+                            request_started.elapsed(),
+                            runtime_label
+                        );
+                    }
+                    let label = voice_model.display_name();
+                    let synth_started = Instant::now();
+                    let audio = model
+                        .synthesize(&request)
+                        .context(format!("synthesize speech with {label}"))
+                        .map_err(SynthesisFailure::Runtime)?;
+                    if voice_model == VoiceModel::VibeVoice {
+                        info!(
+                            "VibeVoice 1.5B synthesized {} chars in {:?} on {}. Total {:?}.",
+                            spoken_text.chars().count(),
+                            synth_started.elapsed(),
+                            runtime_label,
+                            total_started.elapsed()
+                        );
+                    }
+                    Ok((audio, voice))
+                }
+                LoadedModelKind::Parler(runtime) => {
+                    let audio =
+                        synthesize_with_parler(runtime, &spoken_text, voice.as_deref(), &overrides)
+                            .context("synthesize speech with Parler-TTS")
+                            .map_err(SynthesisFailure::Runtime)?;
+                    Ok((audio, voice))
+                }
+            }
+        })
+        .await
+        .map_err(|error| SynthesisFailure::Runtime(anyhow!(error)))?
+    }
+
+    fn force_vibevoice_auto_cpu_fallback(&self) {
+        self.auto_precision_overrides
+            .lock()
+            .unwrap()
+            .insert(VoiceModel::VibeVoice, TtsPrecision::F32);
+        self.cache.lock().unwrap().remove(&ModelCacheKey {
+            voice_model: VoiceModel::VibeVoice,
+            precision: TtsPrecision::Auto,
+        });
     }
 }
 
@@ -275,28 +1018,39 @@ fn load_vibevoice_realtime(asset_root: PathBuf, precision: TtsPrecision) -> Resu
 }
 
 fn load_vibevoice(asset_root: PathBuf, precision: TtsPrecision) -> Result<LoadedModel> {
+    let prepare_started = Instant::now();
     let cache_dir = prepare_vibevoice_snapshot(&asset_root)?;
+    let prepare_elapsed = prepare_started.elapsed();
     let dtype = requested_dtype(VoiceModel::VibeVoice, precision);
-    if dtype == DType::F32 {
+    let load_started = Instant::now();
+    let loaded = if dtype == DType::F32 {
         // Upstream any-tts 0.1.1 completes VibeVoice 1.5B requests on CPU F32,
         // while the same upstream Metal F32 path hangs for small requests.
-        return load_on_device(
+        load_on_device(
             "VibeVoice 1.5B",
             ModelType::VibeVoice,
             VV_ID,
             cache_dir,
             DeviceSelection::Cpu,
             DType::F32,
-        );
-    }
-    load_on_metal(
-        "VibeVoice 1.5B",
-        ModelType::VibeVoice,
-        VV_ID,
-        cache_dir,
-        dtype,
-        precision == TtsPrecision::Auto,
-    )
+        )?
+    } else {
+        load_on_metal(
+            "VibeVoice 1.5B",
+            ModelType::VibeVoice,
+            VV_ID,
+            cache_dir,
+            dtype,
+            false,
+        )?
+    };
+    info!(
+        "VibeVoice 1.5B prepared assets in {:?} and initialized runtime in {:?} using {}.",
+        prepare_elapsed,
+        load_started.elapsed(),
+        loaded.runtime_label
+    );
+    Ok(loaded)
 }
 
 fn load_kokoro(asset_root: PathBuf, precision: TtsPrecision) -> Result<LoadedModel> {
@@ -324,9 +1078,8 @@ fn load_parler(asset_root: PathBuf, precision: TtsPrecision) -> Result<LoadedMod
     let config_file = model_dir.join("config.json");
 
     info!("Loading Parler-TTS weights with {}", dtype_label(dtype));
-    let vb =
-        unsafe { VarBuilder::from_mmaped_safetensors(&[model_file], dtype, &device) }
-            .context("load Parler-TTS weights")?;
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[model_file], dtype, &device) }
+        .context("load Parler-TTS weights")?;
     let config: ParlerConfig =
         serde_json::from_slice(&std::fs::read(&config_file).context("read Parler config.json")?)
             .context("parse Parler config.json")?;
@@ -543,9 +1296,7 @@ pub fn initialize_tracing() -> Result<()> {
 
     let file_path = log_path.clone();
     tracing_subscriber::registry()
-        .with(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("devvoice=info")),
-        )
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("devvoice=info")))
         .with(tracing_subscriber::fmt::layer().with_target(false))
         .with(
             tracing_subscriber::fmt::layer()
@@ -568,8 +1319,12 @@ pub fn initialize_tracing() -> Result<()> {
 
 fn prepare_vibevoice_realtime_snapshot(asset_root: &Path) -> Result<PathBuf> {
     let cache_root = asset_root.join("hf-cache");
-    std::fs::create_dir_all(&cache_root)
-        .with_context(|| format!("create Hugging Face cache directory {}", cache_root.display()))?;
+    std::fs::create_dir_all(&cache_root).with_context(|| {
+        format!(
+            "create Hugging Face cache directory {}",
+            cache_root.display()
+        )
+    })?;
 
     let local_dir = asset_root.join(VR_DIR);
     std::fs::create_dir_all(&local_dir)
@@ -619,14 +1374,21 @@ fn prepare_vibevoice_realtime_snapshot(asset_root: &Path) -> Result<PathBuf> {
     }
 
     download_voice_presets(&local_dir.join("voices"))?;
-    ensure_required_assets(&local_dir, &["config.json", "tokenizer.json", "model.safetensors"])?;
+    ensure_required_assets(
+        &local_dir,
+        &["config.json", "tokenizer.json", "model.safetensors"],
+    )?;
     Ok(local_dir)
 }
 
 fn prepare_vibevoice_snapshot(asset_root: &Path) -> Result<PathBuf> {
     let cache_root = asset_root.join("hf-cache");
-    std::fs::create_dir_all(&cache_root)
-        .with_context(|| format!("create Hugging Face cache directory {}", cache_root.display()))?;
+    std::fs::create_dir_all(&cache_root).with_context(|| {
+        format!(
+            "create Hugging Face cache directory {}",
+            cache_root.display()
+        )
+    })?;
 
     let local_dir = asset_root.join(VV_DIR);
     std::fs::create_dir_all(&local_dir)
@@ -694,8 +1456,12 @@ fn prepare_vibevoice_snapshot(asset_root: &Path) -> Result<PathBuf> {
 
 fn prepare_kokoro_snapshot(asset_root: &Path) -> Result<PathBuf> {
     let cache_root = asset_root.join("hf-cache");
-    std::fs::create_dir_all(&cache_root)
-        .with_context(|| format!("create Hugging Face cache directory {}", cache_root.display()))?;
+    std::fs::create_dir_all(&cache_root).with_context(|| {
+        format!(
+            "create Hugging Face cache directory {}",
+            cache_root.display()
+        )
+    })?;
 
     let local_dir = asset_root.join(KO_DIR);
     std::fs::create_dir_all(&local_dir)
@@ -741,8 +1507,12 @@ fn prepare_kokoro_snapshot(asset_root: &Path) -> Result<PathBuf> {
 
 fn prepare_parler_snapshot(asset_root: &Path) -> Result<PathBuf> {
     let cache_root = asset_root.join("hf-cache");
-    std::fs::create_dir_all(&cache_root)
-        .with_context(|| format!("create Hugging Face cache directory {}", cache_root.display()))?;
+    std::fs::create_dir_all(&cache_root).with_context(|| {
+        format!(
+            "create Hugging Face cache directory {}",
+            cache_root.display()
+        )
+    })?;
 
     let local_dir = asset_root.join(PA_DIR);
     std::fs::create_dir_all(&local_dir)
@@ -766,7 +1536,10 @@ fn prepare_parler_snapshot(asset_root: &Path) -> Result<PathBuf> {
             .with_context(|| format!("download Parler-TTS asset {file}"))?;
     }
 
-    ensure_required_assets(&local_dir, &["config.json", "tokenizer.json", "model.safetensors"])?;
+    ensure_required_assets(
+        &local_dir,
+        &["config.json", "tokenizer.json", "model.safetensors"],
+    )?;
     Ok(local_dir)
 }
 
@@ -913,7 +1686,11 @@ fn normalize_pcm(samples: Vec<f32>) -> Vec<f32> {
     let peak = samples
         .iter()
         .fold(0.0_f32, |max, sample| max.max(sample.abs()));
-    let gain = if peak > 0.0 { (0.95 / peak).min(4.0) } else { 1.0 };
+    let gain = if peak > 0.0 {
+        (0.95 / peak).min(4.0)
+    } else {
+        1.0
+    };
     samples
         .into_iter()
         .map(|sample| (sample * gain).clamp(-1.0, 1.0))
@@ -942,6 +1719,8 @@ fn build_request(
     model: VoiceModel,
     voice: Option<&str>,
     overrides: &SpeechOverrides,
+    reference_audio_cache: &Arc<Mutex<HashMap<PathBuf, CachedReferenceAudio>>>,
+    preset_embedding: Option<VoiceEmbedding>,
 ) -> Result<SynthesisRequest> {
     let mut request = SynthesisRequest::new(text).with_language("en");
 
@@ -952,13 +1731,28 @@ fn build_request(
                 .with_temperature(0.15);
         }
         VoiceModel::VibeVoice => {
-            if let Some(path) = overrides.reference_audio_path.as_deref() {
-                request = request.with_reference_audio(load_reference_audio(path)?);
+            let effective_max_tokens = vibevoice_effective_max_tokens(text, overrides.max_tokens);
+            if let Some(requested_max_tokens) = overrides
+                .max_tokens
+                .filter(|requested| *requested != effective_max_tokens)
+            {
+                info!(
+                    "Capping VibeVoice 1.5B max_tokens from {} to {} for a short prompt.",
+                    requested_max_tokens, effective_max_tokens
+                );
+            }
+            if let Some(embedding) = preset_embedding {
+                request = request.with_voice_embedding(embedding);
+            } else if let Some(path) = overrides.reference_audio_path.as_deref() {
+                request = request.with_reference_audio(load_reference_audio_cached(
+                    reference_audio_cache,
+                    path,
+                )?);
             }
             request = request
                 .with_cfg_scale(overrides.cfg_scale.unwrap_or(1.3))
                 .with_temperature(overrides.temperature.unwrap_or(0.0))
-                .with_max_tokens(overrides.max_tokens.unwrap_or_else(|| vibevoice_max_tokens(text)));
+                .with_max_tokens(effective_max_tokens);
         }
         VoiceModel::ParlerTts => {}
         VoiceModel::Kokoro => {
@@ -994,10 +1788,323 @@ fn vibevoice_max_tokens(text: &str) -> usize {
     estimated.clamp(32, 128)
 }
 
+fn vibevoice_effective_max_tokens(text: &str, requested: Option<usize>) -> usize {
+    let recommended = vibevoice_max_tokens(text);
+    match requested {
+        Some(value)
+            if text.split_whitespace().count() <= 24
+                && text.chars().count() <= 160
+                && value > recommended =>
+        {
+            recommended
+        }
+        Some(value) => value,
+        None => recommended,
+    }
+}
+
 fn load_reference_audio(path: &str) -> Result<ReferenceAudio> {
     let audio = AudioSamples::from_audio_file(path)
         .with_context(|| format!("load reference audio from {}", path))?;
     Ok(ReferenceAudio::new(audio.samples, audio.sample_rate))
+}
+
+fn load_reference_audio_cached(
+    cache: &Arc<Mutex<HashMap<PathBuf, CachedReferenceAudio>>>,
+    path: &str,
+) -> Result<ReferenceAudio> {
+    let path = fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+    let metadata =
+        fs::metadata(&path).with_context(|| format!("read metadata for {}", path.display()))?;
+    let modified_at = metadata.modified().ok();
+
+    if let Some(cached) = cache.lock().unwrap().get(&path) {
+        if cached.modified_at == modified_at {
+            info!(
+                "Reusing cached VibeVoice 1.5B reference audio from {} ({:.1}s clip).",
+                path.display(),
+                cached.audio.duration_secs()
+            );
+            return Ok(cached.audio.clone());
+        }
+    }
+
+    let load_started = Instant::now();
+    let audio = load_reference_audio(&path.to_string_lossy())?;
+    if audio.duration_secs() > 10.0 {
+        warn!(
+            "Reference audio {} is {:.1}s long. VibeVoice 1.5B works best with a clean 3 to 10 second clip.",
+            path.display(),
+            audio.duration_secs()
+        );
+    }
+    info!(
+        "Loaded VibeVoice 1.5B reference audio from {} in {:?} ({:.1}s clip).",
+        path.display(),
+        load_started.elapsed(),
+        audio.duration_secs()
+    );
+    cache.lock().unwrap().insert(
+        path,
+        CachedReferenceAudio {
+            modified_at,
+            audio: audio.clone(),
+        },
+    );
+    Ok(audio)
+}
+
+fn load_vibevoice_preprocessor_config(asset_root: &Path) -> Result<VibeVoicePreprocessorConfig> {
+    let config_path = asset_root.join(VV_DIR).join("preprocessor_config.json");
+    if config_path.exists() {
+        return VibeVoicePreprocessorConfig::from_file(&config_path)
+            .map_err(|error| anyhow!("load VibeVoice preprocessor config: {error}"));
+    }
+    Ok(VibeVoicePreprocessorConfig::default())
+}
+
+fn normalize_vibevoice_reference_audio(
+    audio: &ReferenceAudio,
+    config: &VibeVoicePreprocessorConfig,
+) -> Vec<f32> {
+    let resampled = if audio.sample_rate != config.audio_processor.sampling_rate {
+        resample_linear(
+            &audio.samples,
+            audio.sample_rate,
+            config.audio_processor.sampling_rate,
+        )
+    } else {
+        audio.samples.clone()
+    };
+    if !config.db_normalize {
+        return resampled;
+    }
+    normalize_dbfs(
+        &resampled,
+        config.audio_processor.target_d_b_fs,
+        config.audio_processor.eps,
+    )
+}
+
+fn normalize_dbfs(samples: &[f32], target_db_fs: f32, eps: f32) -> Vec<f32> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let rms =
+        (samples.iter().map(|value| value * value).sum::<f32>() / samples.len() as f32).sqrt();
+    let scalar = 10f32.powf(target_db_fs / 20.0) / (rms + eps);
+    samples
+        .iter()
+        .map(|value| (value * scalar).clamp(-1.0, 1.0))
+        .collect()
+}
+
+fn slugify_preset_name(name: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-').chars().take(48).collect::<String>();
+    if slug.is_empty() {
+        "preset".to_owned()
+    } else {
+        slug
+    }
+}
+
+fn normalize_vibevoice_preset_name(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
+fn ensure_unique_vibevoice_preset_name(preset_dir: &Path, preset_name: &str) -> Result<()> {
+    let normalized_name = normalize_vibevoice_preset_name(preset_name);
+    if normalized_name.is_empty() {
+        bail!("Preset name cannot be empty.");
+    }
+    let existing = load_all_vibevoice_presets(preset_dir)?;
+    if let Some(duplicate) = existing
+        .into_iter()
+        .find(|preset| normalize_vibevoice_preset_name(&preset.info.name) == normalized_name)
+    {
+        bail!(
+            "A VibeVoice preset named '{}' already exists with id '{}'. Use a unique name.",
+            duplicate.info.name,
+            duplicate.info.id
+        );
+    }
+    Ok(())
+}
+
+fn validate_vibevoice_preset_id(preset_id: &str) -> Result<String> {
+    let preset_id = preset_id.trim();
+    if preset_id.is_empty() {
+        bail!("Preset id cannot be empty.");
+    }
+    if !preset_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        bail!("Preset id must use only letters, numbers, hyphens, or underscores.");
+    }
+    Ok(preset_id.to_owned())
+}
+
+fn vibevoice_preset_path(preset_dir: &Path, preset_id: &str) -> PathBuf {
+    preset_dir.join(format!("{preset_id}.json"))
+}
+
+fn copy_vibevoice_preset_audio(
+    source_path: &Path,
+    audio_dir: &Path,
+    preset_id: &str,
+) -> Result<PathBuf> {
+    let extension = source_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("wav");
+    let destination = audio_dir.join(format!("{preset_id}.{extension}"));
+    fs::copy(source_path, &destination).with_context(|| {
+        format!(
+            "copy VibeVoice reference audio from {} to {}",
+            source_path.display(),
+            destination.display()
+        )
+    })?;
+    Ok(destination)
+}
+
+fn load_stored_vibevoice_preset(path: &Path) -> Result<StoredVibeVoicePreset> {
+    let bytes =
+        fs::read(path).with_context(|| format!("read VibeVoice preset {}", path.display()))?;
+    serde_json::from_slice(&bytes).context("parse VibeVoice preset")
+}
+
+fn load_all_vibevoice_presets(preset_dir: &Path) -> Result<Vec<StoredVibeVoicePreset>> {
+    if !preset_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut presets = Vec::new();
+    for entry in fs::read_dir(preset_dir)
+        .with_context(|| format!("read VibeVoice preset directory {}", preset_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        presets.push(load_stored_vibevoice_preset(&path)?);
+    }
+    Ok(presets)
+}
+
+fn find_vibevoice_preset_by_name(
+    preset_dir: &Path,
+    preset_name: &str,
+) -> Result<StoredVibeVoicePreset> {
+    let normalized_name = normalize_vibevoice_preset_name(preset_name);
+    if normalized_name.is_empty() {
+        bail!("Preset name cannot be empty.");
+    }
+    let matches = load_all_vibevoice_presets(preset_dir)?
+        .into_iter()
+        .filter(|preset| normalize_vibevoice_preset_name(&preset.info.name) == normalized_name)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => bail!(
+            "No VibeVoice preset named '{}' was found.",
+            preset_name.trim()
+        ),
+        [preset] => Ok(preset.clone()),
+        _ => bail!(
+            "Multiple VibeVoice presets named '{}' were found. Use reference_preset_id instead.",
+            preset_name.trim()
+        ),
+    }
+}
+
+fn provision_vibevoice_mlx_runtime(data_dir: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(data_dir)
+        .with_context(|| format!("create DevVoice data directory {}", data_dir.display()))?;
+    let venv_dir = data_dir.join("vibevoice-mlx-venv");
+    let python_path = venv_dir.join("bin/python");
+    if python_path.is_file() && validate_vibevoice_mlx_runtime(&python_path).is_ok() {
+        return Ok(python_path);
+    }
+
+    info!(
+        "Provisioning VibeVoice MLX runtime in {}.",
+        venv_dir.display()
+    );
+    let mut create_venv = Command::new("python3");
+    create_venv.arg("-m").arg("venv").arg(&venv_dir);
+    run_command(
+        &mut create_venv,
+        "create the VibeVoice MLX virtual environment",
+    )?;
+
+    let mut upgrade_pip = Command::new(&python_path);
+    upgrade_pip
+        .arg("-m")
+        .arg("pip")
+        .arg("install")
+        .arg("--upgrade")
+        .arg("pip");
+    run_command(
+        &mut upgrade_pip,
+        "upgrade pip for the VibeVoice MLX runtime",
+    )?;
+
+    let mut install_runtime = Command::new(&python_path);
+    install_runtime
+        .arg("-m")
+        .arg("pip")
+        .arg("install")
+        .arg(VIBEVOICE_MLX_INSTALL_SPEC)
+        .arg("scipy");
+    run_command(
+        &mut install_runtime,
+        "install the VibeVoice MLX runtime dependencies",
+    )?;
+
+    validate_vibevoice_mlx_runtime(&python_path)?;
+    info!(
+        "Provisioned VibeVoice MLX runtime at {}.",
+        python_path.display()
+    );
+    Ok(python_path)
+}
+
+fn validate_vibevoice_mlx_runtime(python_path: &Path) -> Result<()> {
+    let mut validate = Command::new(python_path);
+    validate.arg("-c").arg("import vibevoice_mlx, scipy");
+    run_command(&mut validate, "validate the VibeVoice MLX runtime")
+}
+
+fn run_command(command: &mut Command, description: &str) -> Result<()> {
+    let output = command
+        .output()
+        .with_context(|| format!("start command to {description}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("process exited with status {}", output.status)
+    };
+    bail!("Failed to {description}: {detail}");
 }
 
 fn normalize_technical_text(input: &str) -> String {

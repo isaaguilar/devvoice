@@ -22,6 +22,7 @@
           <p id="config-path" class="mono">Config: -</p>
           <p id="log-path" class="mono">Log: -</p>
           <p id="http-api-label" class="mono">HTTP API: -</p>
+          <p id="tts-backend-label" class="mono">TTS backend: -</p>
         </div>
       </section>
 
@@ -100,6 +101,17 @@
               <option value="">Default</option>
             </select>
             <small class="field-note">Presets populate automatically when the model finishes loading.</small>
+          </label>
+
+          <label class="field field--full">
+            <span>TTS precision</span>
+            <select id="tts-precision">
+              <option value="auto">Auto</option>
+              <option value="f16">F16</option>
+              <option value="bf16">BF16</option>
+              <option value="f32">F32</option>
+            </select>
+            <small id="tts-precision-note" class="field-note">Auto preserves the current fast 0.5B behavior. VibeVoice 1.5B now runs through the MLX backend and uses auto precision only.</small>
           </label>
 
           <label class="field">
