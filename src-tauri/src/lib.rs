@@ -133,7 +133,14 @@ struct RuntimeState {
     model_ready: bool,
     playback_paused: bool,
     available_voices: Vec<String>,
-    last_hotkey_press: Option<Instant>,
+    last_hotkey_press: Option<PendingHotkeyPress>,
+    next_hotkey_press_id: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PendingHotkeyPress {
+    id: u64,
+    pressed_at: Instant,
 }
 
 impl Default for RuntimeState {
@@ -148,6 +155,7 @@ impl Default for RuntimeState {
             playback_paused: false,
             available_voices: Vec::new(),
             last_hotkey_press: None,
+            next_hotkey_press_id: 0,
         }
     }
 }
@@ -385,7 +393,40 @@ impl AppRuntime {
         is_active_status(runtime.status)
     }
 
+    fn clear_pending_hotkey_press(&self) {
+        let mut runtime = self.runtime.lock().unwrap();
+        runtime.last_hotkey_press = None;
+    }
+
+    fn consume_pending_hotkey_press(&self, press_id: u64) -> bool {
+        let mut runtime = self.runtime.lock().unwrap();
+        match runtime.last_hotkey_press {
+            Some(pending) if pending.id == press_id => {
+                runtime.last_hotkey_press = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn schedule_single_tap_hotkey(&self, app: &AppHandle, press_id: u64) {
+        let app_handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(HOTKEY_DOUBLE_PRESS_WINDOW).await;
+
+            let runtime = app_handle.state::<AppRuntime>();
+            if !runtime.consume_pending_hotkey_press(press_id) {
+                return;
+            }
+
+            if let Err(error) = runtime.enqueue_selection(&app_handle).await {
+                runtime.mark_error(&app_handle, error.to_string());
+            }
+        });
+    }
+
     pub async fn speak_selection(&self, app: &AppHandle) -> Result<SpeakOutcome> {
+        self.clear_pending_hotkey_press();
         self.speech_queue.clear_and_invalidate();
         self.mark_status(
             app,
@@ -411,6 +452,7 @@ impl AppRuntime {
     }
 
     pub async fn speak_manual_text(&self, app: &AppHandle, text: String) -> Result<SpeakOutcome> {
+        self.clear_pending_hotkey_press();
         self.speech_queue.clear_and_invalidate();
         let job = self.playback.begin_job()?;
         self.process_text(
@@ -423,6 +465,7 @@ impl AppRuntime {
     }
 
     pub async fn enqueue_selection(&self, app: &AppHandle) -> Result<usize> {
+        self.clear_pending_hotkey_press();
         self.mark_status(
             app,
             AppStatus::CapturingSelection,
@@ -446,6 +489,7 @@ impl AppRuntime {
     }
 
     pub fn enqueue_manual_text(&self, app: &AppHandle, text: String) -> Result<usize> {
+        self.clear_pending_hotkey_press();
         let trimmed = text.trim().to_owned();
         if trimmed.is_empty() {
             let error = anyhow!("Enter text to queue.");
@@ -642,6 +686,7 @@ impl AppRuntime {
     }
 
     pub fn skip_current_item(&self, app: &AppHandle) -> Result<AppSnapshot> {
+        self.clear_pending_hotkey_press();
         if !self.has_skippable_work() {
             self.mark_status(app, AppStatus::Ready, "Nothing is queued right now.");
             return Ok(self.snapshot());
@@ -652,7 +697,6 @@ impl AppRuntime {
         {
             let mut runtime = self.runtime.lock().unwrap();
             runtime.playback_paused = false;
-            runtime.last_hotkey_press = None;
         }
         let detail = if self.speech_queue.len() > 0 {
             "Skipping the current message and continuing with the queue."
@@ -665,21 +709,36 @@ impl AppRuntime {
 
     pub async fn handle_shortcut(&self, app: &AppHandle) -> Result<()> {
         let now = Instant::now();
-        let double_press = {
+        let pending_press_id = {
             let mut runtime = self.runtime.lock().unwrap();
-            let is_double = runtime
-                .last_hotkey_press
-                .map(|last| now.duration_since(last) <= HOTKEY_DOUBLE_PRESS_WINDOW)
-                .unwrap_or(false);
-            runtime.last_hotkey_press = if is_double { None } else { Some(now) };
-            is_double
+            if let Some(last) = runtime.last_hotkey_press {
+                if now.duration_since(last.pressed_at) <= HOTKEY_DOUBLE_PRESS_WINDOW {
+                    runtime.last_hotkey_press = None;
+                    None
+                } else {
+                    runtime.next_hotkey_press_id += 1;
+                    let press_id = runtime.next_hotkey_press_id;
+                    runtime.last_hotkey_press = Some(PendingHotkeyPress {
+                        id: press_id,
+                        pressed_at: now,
+                    });
+                    Some(press_id)
+                }
+            } else {
+                runtime.next_hotkey_press_id += 1;
+                let press_id = runtime.next_hotkey_press_id;
+                runtime.last_hotkey_press = Some(PendingHotkeyPress {
+                    id: press_id,
+                    pressed_at: now,
+                });
+                Some(press_id)
+            }
         };
 
-        let playback_active = self.has_skippable_work();
-        if double_press && playback_active {
+        if let Some(press_id) = pending_press_id {
+            self.schedule_single_tap_hotkey(app, press_id);
+        } else if self.has_skippable_work() {
             self.skip_current_item(app)?;
-        } else {
-            let _ = self.enqueue_selection(app).await?;
         }
 
         Ok(())
@@ -860,12 +919,12 @@ impl AppRuntime {
     }
 
     pub fn stop_playback(&self, app: &AppHandle) -> Result<AppSnapshot> {
+        self.clear_pending_hotkey_press();
         self.speech_queue.clear_and_invalidate();
         self.playback.stop()?;
         {
             let mut runtime = self.runtime.lock().unwrap();
             runtime.playback_paused = false;
-            runtime.last_hotkey_press = None;
         }
         self.mark_status(app, AppStatus::Ready, "Playback stopped.");
         Ok(self.snapshot())
