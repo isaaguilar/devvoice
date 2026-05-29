@@ -18,6 +18,7 @@
         <div class="hero-status">
           <span id="status-pill" class="status-pill status-pill--idle">Idle</span>
           <p id="status-detail" class="muted">Starting up...</p>
+          <p id="queue-status" class="mono">Queue: -</p>
           <p id="hotkey-label" class="mono">Hotkey: -</p>
           <p id="config-path" class="mono">Config: -</p>
           <p id="log-path" class="mono">Log: -</p>
@@ -29,8 +30,8 @@
       <section class="panel">
         <div class="panel-head">
           <div>
-            <h2>Speak</h2>
-            <p>Use the global shortcut or these controls to test the pipeline end to end.</p>
+            <h2>Queue and playback</h2>
+            <p>Use the global shortcut or these controls to queue selected text and manage playback.</p>
           </div>
           <div class="button-row">
             <button id="show-window" type="button" class="secondary">Focus window</button>
@@ -39,18 +40,19 @@
         </div>
 
         <div class="button-row">
-          <button id="speak-selection" type="button">Speak selection</button>
+          <button id="speak-selection" type="button">Queue selection</button>
+          <button id="skip-next" type="button" class="secondary">Next</button>
           <button id="pause-playback" type="button" class="secondary">Pause</button>
           <button id="stop-playback" type="button" class="danger">Stop</button>
         </div>
 
         <label class="field">
           <span>Manual text</span>
-          <textarea id="manual-text" rows="7" placeholder="Paste text here to test the Gemini rewrite and TTS flow without relying on selected-text capture."></textarea>
+          <textarea id="manual-text" rows="7" placeholder="Paste text here to queue it without relying on selected-text capture."></textarea>
         </label>
 
         <div class="button-row">
-          <button id="speak-manual" type="button">Speak manual text</button>
+          <button id="speak-manual" type="button">Queue manual text</button>
         </div>
       </section>
 
@@ -123,7 +125,7 @@
           <label class="field">
             <span>Global hotkey</span>
             <input id="shortcut" type="text" placeholder="Command+Control+S" />
-            <small class="field-note">Default hotkey: Command+Control+S.</small>
+            <small class="field-note">Default hotkey: Command+Control+S. A single press queues the current selection, and a double press skips the current item.</small>
           </label>
 
           <div class="field field--full">

@@ -15,6 +15,7 @@ const STATUS_LABELS = {
 const elements = {
   statusPill: document.querySelector("#status-pill"),
   statusDetail: document.querySelector("#status-detail"),
+  queueStatus: document.querySelector("#queue-status"),
   hotkeyLabel: document.querySelector("#hotkey-label"),
   configPath: document.querySelector("#config-path"),
   logPath: document.querySelector("#log-path"),
@@ -36,6 +37,7 @@ const elements = {
   manualText: document.querySelector("#manual-text"),
   speakSelection: document.querySelector("#speak-selection"),
   speakManual: document.querySelector("#speak-manual"),
+  skipNext: document.querySelector("#skip-next"),
   pausePlayback: document.querySelector("#pause-playback"),
   stopPlayback: document.querySelector("#stop-playback"),
   showWindow: document.querySelector("#show-window"),
@@ -51,6 +53,8 @@ const elements = {
 
 let configPath = "-";
 let logPath = "-";
+let latestSnapshot = null;
+let isBusy = false;
 function requireElement(element, selector) {
   if (!element) {
     throw new Error(`Missing required element: ${selector}`);
@@ -196,11 +200,18 @@ function renderModelInstructions(snapshot) {
 }
 
 function renderSnapshot(snapshot) {
+  latestSnapshot = snapshot;
   const pill = requireElement(elements.statusPill, "#status-pill");
   pill.textContent = STATUS_LABELS[snapshot.status] || snapshot.status;
   pill.className = `status-pill status-pill--${snapshot.status}`;
 
   setText(elements.statusDetail, snapshot.statusDetail);
+  if (snapshot.canSkip && snapshot.queueLength === 0) {
+    setText(elements.queueStatus, "Queue: current item only");
+  } else {
+    const noun = snapshot.queueLength === 1 ? "item" : "items";
+    setText(elements.queueStatus, `Queue: ${snapshot.queueLength} ${noun} waiting`);
+  }
   setText(elements.hotkeyLabel, `Hotkey: ${snapshot.config.shortcut}`);
   setText(elements.configPath, `Config: ${configPath}`);
   setText(elements.logPath, `Log: ${logPath}`);
@@ -223,20 +234,23 @@ function renderSnapshot(snapshot) {
   requireElement(elements.pausePlayback, "#pause-playback").textContent = snapshot.playbackPaused
     ? "Resume"
     : "Pause";
+  requireElement(elements.skipNext, "#skip-next").disabled = isBusy || !snapshot.canSkip;
 }
 
 function setBusy(disabled) {
+  isBusy = disabled;
   for (const key of [
     "saveSettings",
     "speakSelection",
     "speakManual",
-    "pausePlayback",
-    "stopPlayback",
     "showWindow",
     "openLog",
   ]) {
     requireElement(elements[key], `#${key}`).disabled = disabled;
   }
+  requireElement(elements.pausePlayback, "#pause-playback").disabled = disabled;
+  requireElement(elements.stopPlayback, "#stop-playback").disabled = disabled;
+  requireElement(elements.skipNext, "#skip-next").disabled = disabled || !(latestSnapshot?.canSkip);
 }
 
 async function refreshSnapshot() {
@@ -299,14 +313,13 @@ document.addEventListener("DOMContentLoaded", async () => {
   requireElement(elements.speakSelection, "#speak-selection").addEventListener("click", async () => {
     setBusy(true);
     try {
-      const outcome = await invoke("speak_selection");
-      if (outcome) {
-        setText(elements.lastSelection, outcome.rawSelection || "-");
-        setText(elements.lastOutput, outcome.preparedText || "-");
+      const snapshot = await invoke("speak_selection");
+      if (snapshot) {
+        renderSnapshot(snapshot);
       }
-      await refreshSnapshot();
     } finally {
       setBusy(false);
+      await refreshSnapshot();
     }
   });
 
@@ -319,15 +332,19 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     setBusy(true);
     try {
-      const outcome = await invoke("speak_manual_text", { text });
-      if (outcome) {
-        setText(elements.lastSelection, outcome.rawSelection || "-");
-        setText(elements.lastOutput, outcome.preparedText || "-");
+      const snapshot = await invoke("speak_manual_text", { text });
+      if (snapshot) {
+        renderSnapshot(snapshot);
       }
-      await refreshSnapshot();
     } finally {
       setBusy(false);
+      await refreshSnapshot();
     }
+  });
+
+  requireElement(elements.skipNext, "#skip-next").addEventListener("click", async () => {
+    await invoke("skip_current_item");
+    await refreshSnapshot();
   });
 
   requireElement(elements.pausePlayback, "#pause-playback").addEventListener("click", async () => {

@@ -35,6 +35,16 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 const TRAY_ID: &str = "devvoice-tray";
 const HOTKEY_DOUBLE_PRESS_WINDOW: Duration = Duration::from_millis(450);
 
+fn is_active_status(status: AppStatus) -> bool {
+    matches!(
+        status,
+        AppStatus::CapturingSelection
+            | AppStatus::RewritingText
+            | AppStatus::Synthesizing
+            | AppStatus::Speaking
+    )
+}
+
 enum SpeechMode {
     Direct(u64),
     Queued { queue_gen: u64, item_token: u64 },
@@ -130,7 +140,7 @@ impl Default for RuntimeState {
     fn default() -> Self {
         Self {
             status: AppStatus::Idle,
-            status_detail: "Ready to speak selected text.".to_owned(),
+            status_detail: "Ready to queue selected text.".to_owned(),
             last_selection: None,
             last_prepared_text: None,
             last_error: None,
@@ -171,6 +181,8 @@ impl AppRuntime {
     pub fn snapshot(&self) -> AppSnapshot {
         let config = self.config.read().unwrap().clone();
         let runtime = self.runtime.lock().unwrap();
+        let queue_length = self.speech_queue.len();
+        let can_skip = !self.playback.is_empty() || is_active_status(runtime.status);
         let model_instructions = describe_model_instructions(config.voice_model);
         let tts_runtime_label = self
             .tts
@@ -190,6 +202,8 @@ impl AppRuntime {
                 .unwrap_or(false),
             model_ready: runtime.model_ready,
             playback_paused: runtime.playback_paused,
+            queue_length,
+            can_skip,
             last_selection: runtime.last_selection.clone(),
             last_prepared_text: runtime.last_prepared_text.clone(),
             last_error: runtime.last_error.clone(),
@@ -359,13 +373,16 @@ impl AppRuntime {
 
     pub fn is_active(&self) -> bool {
         let runtime = self.runtime.lock().unwrap();
-        matches!(
-            runtime.status,
-            AppStatus::Speaking
-                | AppStatus::Synthesizing
-                | AppStatus::RewritingText
-                | AppStatus::CapturingSelection
-        )
+        is_active_status(runtime.status)
+    }
+
+    pub fn has_skippable_work(&self) -> bool {
+        if !self.playback.is_empty() {
+            return true;
+        }
+
+        let runtime = self.runtime.lock().unwrap();
+        is_active_status(runtime.status)
     }
 
     pub async fn speak_selection(&self, app: &AppHandle) -> Result<SpeakOutcome> {
@@ -426,6 +443,24 @@ impl AppRuntime {
         }
         self.emit_snapshot(app);
         self.enqueue_text(app, selection.raw, SpeechOverrides::default())
+    }
+
+    pub fn enqueue_manual_text(&self, app: &AppHandle, text: String) -> Result<usize> {
+        let trimmed = text.trim().to_owned();
+        if trimmed.is_empty() {
+            let error = anyhow!("Enter text to queue.");
+            self.mark_error(app, error.to_string());
+            return Err(error);
+        }
+
+        {
+            let mut runtime = self.runtime.lock().unwrap();
+            runtime.last_selection = Some(trimmed.clone());
+            runtime.playback_paused = false;
+        }
+        self.emit_snapshot(app);
+
+        self.enqueue_text(app, trimmed, SpeechOverrides::default())
     }
 
     pub fn enqueue_text(
@@ -607,16 +642,22 @@ impl AppRuntime {
     }
 
     pub fn skip_current_item(&self, app: &AppHandle) -> Result<AppSnapshot> {
+        if !self.has_skippable_work() {
+            self.mark_status(app, AppStatus::Ready, "Nothing is queued right now.");
+            return Ok(self.snapshot());
+        }
+
         self.speech_queue.skip_current_item();
         self.playback.stop()?;
         {
             let mut runtime = self.runtime.lock().unwrap();
             runtime.playback_paused = false;
+            runtime.last_hotkey_press = None;
         }
         let detail = if self.speech_queue.len() > 0 {
-            "Skipping the current message and continuing the queue."
+            "Skipping the current message and continuing with the queue."
         } else {
-            "Playback stopped."
+            "Skipped the current message. Queue is empty."
         };
         self.mark_status(app, AppStatus::Ready, detail);
         Ok(self.snapshot())
@@ -634,8 +675,7 @@ impl AppRuntime {
             is_double
         };
 
-        let playback_active =
-            !self.playback.is_empty() || self.is_active() || self.speech_queue.len() > 0;
+        let playback_active = self.has_skippable_work();
         if double_press && playback_active {
             self.skip_current_item(app)?;
         } else {
@@ -1105,13 +1145,14 @@ fn open_log_file_inner() -> Result<()> {
 
 fn build_tray(app: &AppHandle) -> Result<()> {
     let show = MenuItem::with_id(app, "show", "Show DevVoice", true, None::<&str>)?;
-    let speak = MenuItem::with_id(
+    let queue_selection = MenuItem::with_id(
         app,
-        "speak-selection",
-        "Speak Selection",
+        "queue-selection",
+        "Queue Selection",
         true,
         None::<&str>,
     )?;
+    let skip_next = MenuItem::with_id(app, "skip-next", "Skip to Next Item", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "pause", "Pause/Resume", true, None::<&str>)?;
     let stop = MenuItem::with_id(app, "stop", "Stop", true, None::<&str>)?;
     let open_log = MenuItem::with_id(app, "open-log", "Open Log File", true, None::<&str>)?;
@@ -1120,7 +1161,16 @@ fn build_tray(app: &AppHandle) -> Result<()> {
 
     let menu = Menu::with_items(
         app,
-        &[&show, &speak, &pause, &stop, &open_log, &separator, &quit],
+        &[
+            &show,
+            &queue_selection,
+            &skip_next,
+            &pause,
+            &stop,
+            &open_log,
+            &separator,
+            &quit,
+        ],
     )?;
     let (icon, is_template) = tray_icon_image(AppStatus::Idle);
 
@@ -1133,12 +1183,16 @@ fn build_tray(app: &AppHandle) -> Result<()> {
             "show" => {
                 let _ = show_main_window_inner(app);
             }
-            "speak-selection" => {
+            "queue-selection" => {
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let runtime = app.state::<AppRuntime>();
-                    let _ = runtime.speak_selection(&app).await;
+                    let _ = runtime.enqueue_selection(&app).await;
                 });
+            }
+            "skip-next" => {
+                let runtime = app.state::<AppRuntime>();
+                let _ = runtime.skip_current_item(app);
             }
             "pause" => {
                 let runtime = app.state::<AppRuntime>();
@@ -1290,22 +1344,30 @@ async fn save_settings(
 async fn speak_selection(
     app: AppHandle,
     state: State<'_, AppRuntime>,
-) -> Result<SpeakOutcome, String> {
+) -> Result<AppSnapshot, String> {
     state
-        .speak_selection(&app)
+        .enqueue_selection(&app)
         .await
+        .map(|_| state.snapshot())
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-async fn speak_manual_text(
+fn speak_manual_text(
     app: AppHandle,
     state: State<'_, AppRuntime>,
     text: String,
-) -> Result<SpeakOutcome, String> {
+) -> Result<AppSnapshot, String> {
     state
-        .speak_manual_text(&app, text)
-        .await
+        .enqueue_manual_text(&app, text)
+        .map(|_| state.snapshot())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn skip_current_item(app: AppHandle, state: State<'_, AppRuntime>) -> Result<AppSnapshot, String> {
+    state
+        .skip_current_item(&app)
         .map_err(|error| error.to_string())
 }
 
@@ -1534,6 +1596,7 @@ pub fn run() {
             save_settings,
             speak_selection,
             speak_manual_text,
+            skip_current_item,
             stop_playback,
             toggle_pause_playback,
             show_main_window,

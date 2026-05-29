@@ -23,6 +23,8 @@ pub struct AppSnapshot {
     pub api_key_present: bool,
     pub model_ready: bool,
     pub playback_paused: bool,
+    pub queue_length: usize,
+    pub can_skip: bool,
     pub last_selection: Option<String>,
     pub last_prepared_text: Option<String>,
     pub last_error: Option<String>,
