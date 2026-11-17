@@ -34,6 +34,8 @@ use tokio::sync::OnceCell;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+mod realtime_mlx;
+
 // VibeVoice Realtime 0.5B
 const VR_OWNER: &str = "microsoft";
 const VR_NAME: &str = "VibeVoice-Realtime-0.5B";
@@ -221,12 +223,12 @@ struct VibeVoiceMlxWorker {
 }
 
 impl VibeVoiceMlxWorker {
-    fn spawn(python_path: &Path, script_path: &Path) -> Result<Self> {
+    fn spawn(python_path: &Path, script_path: &Path, model_id: &str) -> Result<Self> {
         let mut child = Command::new(python_path)
             .arg("-u")
             .arg(script_path)
             .arg("--model")
-            .arg(VIBEVOICE_MLX_MODEL_ID)
+            .arg(model_id)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -253,7 +255,7 @@ impl VibeVoiceMlxWorker {
         })
     }
 
-    fn send(&mut self, request: &VibeVoiceMlxRequest) -> Result<VibeVoiceMlxResponse> {
+    fn send(&mut self, request: &impl Serialize) -> Result<VibeVoiceMlxResponse> {
         let payload = serde_json::to_string(request).context("serialize VibeVoice MLX request")?;
         writeln!(self.stdin, "{payload}").context("write request to VibeVoice MLX worker")?;
         self.stdin
@@ -275,6 +277,23 @@ impl VibeVoiceMlxWorker {
     }
 }
 
+impl Drop for VibeVoiceMlxWorker {
+    fn drop(&mut self) {
+        match self.child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(error) = self.child.kill() {
+                    warn!("Failed to stop VibeVoice MLX worker: {error}");
+                }
+                if let Err(error) = self.child.wait() {
+                    warn!("Failed to reap VibeVoice MLX worker: {error}");
+                }
+            }
+            Err(error) => warn!("Failed to check VibeVoice MLX worker status: {error}"),
+        }
+    }
+}
+
 struct ParlerRuntime {
     model: ParlerModel,
     tokenizer: Tokenizer,
@@ -290,11 +309,13 @@ pub struct TtsService {
     vibevoice_preset_cache: Arc<Mutex<HashMap<String, VoiceEmbedding>>>,
     vibevoice_mlx_worker: Mutex<Option<VibeVoiceMlxWorker>>,
     vibevoice_runtime_label: Mutex<Option<String>>,
+    realtime_mlx: Arc<realtime_mlx::RealtimeMlx>,
 }
 
 impl TtsService {
     pub fn new(asset_root: PathBuf) -> Self {
         Self {
+            realtime_mlx: Arc::new(realtime_mlx::RealtimeMlx::new(asset_root.clone())),
             asset_root,
             cache: Mutex::new(HashMap::new()),
             auto_precision_overrides: Mutex::new(HashMap::new()),
@@ -329,6 +350,9 @@ impl TtsService {
     }
 
     pub fn backend_status(&self, voice_model: VoiceModel, precision: TtsPrecision) -> String {
+        if realtime_mlx::requested(voice_model, precision) {
+            return self.realtime_mlx.backend_status();
+        }
         match voice_model {
             VoiceModel::VibeVoice if !cfg!(target_os = "macos") => {
                 "VibeVoice 1.5B requires macOS because DevVoice only supports the MLX backend for this model."
@@ -386,6 +410,9 @@ impl TtsService {
         voice_model: VoiceModel,
         precision: TtsPrecision,
     ) -> Result<WarmupInfo> {
+        if realtime_mlx::requested(voice_model, precision) {
+            return self.realtime_mlx.warmup().await;
+        }
         if voice_model == VoiceModel::VibeVoice {
             return self
                 .warmup_vibevoice(precision, &SpeechOverrides::default())
@@ -551,32 +578,13 @@ impl TtsService {
             anyhow!("VibeVoice MLX is unavailable because the Python runtime was not found.")
         })?;
         let script_path = self.ensure_vibevoice_mlx_worker_script()?;
-        let mut worker_guard = self.vibevoice_mlx_worker.lock().unwrap();
-        if worker_guard.is_none() {
-            *worker_guard = Some(VibeVoiceMlxWorker::spawn(&python_path, &script_path)?);
-        }
-        let response = match worker_guard
-            .as_mut()
-            .context("VibeVoice MLX worker failed to initialize")?
-            .send(&request)
-        {
-            Ok(response) => response,
-            Err(first_error) => {
-                warn!("Restarting VibeVoice MLX worker after error: {first_error:#}");
-                *worker_guard = Some(VibeVoiceMlxWorker::spawn(&python_path, &script_path)?);
-                worker_guard
-                    .as_mut()
-                    .context("VibeVoice MLX worker failed to restart")?
-                    .send(&request)?
-            }
-        };
-        if !response.ok {
-            bail!(
-                "VibeVoice MLX worker error: {}",
-                response.error.as_deref().unwrap_or("unknown worker error")
-            );
-        }
-        Ok(response)
+        send_mlx_request(
+            &self.vibevoice_mlx_worker,
+            &python_path,
+            &script_path,
+            VIBEVOICE_MLX_MODEL_ID,
+            &request,
+        )
     }
 
     fn ensure_vibevoice_mlx_worker_script(&self) -> Result<PathBuf> {
@@ -587,14 +595,7 @@ impl TtsService {
         fs::create_dir_all(data_dir)
             .with_context(|| format!("create data directory at {}", data_dir.display()))?;
         let script_path = data_dir.join("vibevoice-mlx-worker.py");
-        let needs_write = match fs::read_to_string(&script_path) {
-            Ok(existing) => existing != VIBEVOICE_MLX_WORKER_SCRIPT,
-            Err(_) => true,
-        };
-        if needs_write {
-            fs::write(&script_path, VIBEVOICE_MLX_WORKER_SCRIPT)
-                .with_context(|| format!("write MLX worker script to {}", script_path.display()))?;
-        }
+        write_if_changed(&script_path, VIBEVOICE_MLX_WORKER_SCRIPT)?;
         Ok(script_path)
     }
 
@@ -626,6 +627,12 @@ impl TtsService {
     ) -> Result<(AudioSamples, Option<String>)> {
         let spoken_text = normalize_technical_text(text);
         let overrides = overrides.clone().normalized();
+        if realtime_mlx::requested(voice_model, precision) {
+            return self
+                .realtime_mlx
+                .synthesize(&spoken_text, voice_preset, &overrides)
+                .await;
+        }
         if voice_model == VoiceModel::VibeVoice {
             self.ensure_vibevoice_mlx_runtime(precision).await?;
             return self
@@ -679,6 +686,9 @@ impl TtsService {
         voice_model: VoiceModel,
         precision: TtsPrecision,
     ) -> Option<String> {
+        if realtime_mlx::requested(voice_model, precision) {
+            return self.realtime_mlx.runtime_label();
+        }
         if self.vibevoice_mlx_requested(voice_model, precision) {
             if let Some(runtime_label) = self.vibevoice_runtime_label.lock().unwrap().clone() {
                 return Some(runtime_label);
@@ -2028,6 +2038,61 @@ fn find_vibevoice_preset_by_name(
             preset_name.trim()
         ),
     }
+}
+
+fn write_if_changed(path: &Path, content: &str) -> Result<()> {
+    match fs::read_to_string(path) {
+        Ok(existing) if existing == content => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    }
+    fs::write(path, content).with_context(|| format!("write {}", path.display()))
+}
+
+fn send_mlx_request(
+    worker: &Mutex<Option<VibeVoiceMlxWorker>>,
+    python_path: &Path,
+    script_path: &Path,
+    model_id: &str,
+    request: &impl Serialize,
+) -> Result<VibeVoiceMlxResponse> {
+    let mut worker_guard = worker.lock().unwrap();
+    if worker_guard.is_none() {
+        *worker_guard = Some(VibeVoiceMlxWorker::spawn(
+            python_path,
+            script_path,
+            model_id,
+        )?);
+    }
+    let response = match worker_guard
+        .as_mut()
+        .context("VibeVoice MLX worker failed to initialize")?
+        .send(request)
+    {
+        Ok(response) => response,
+        Err(first_error) => {
+            warn!("Restarting VibeVoice MLX worker after error: {first_error:#}");
+            // Stop the old process before allocating another model on the GPU.
+            *worker_guard = None;
+            *worker_guard = Some(VibeVoiceMlxWorker::spawn(
+                python_path,
+                script_path,
+                model_id,
+            )?);
+            worker_guard
+                .as_mut()
+                .context("VibeVoice MLX worker failed to restart")?
+                .send(request)?
+        }
+    };
+    if !response.ok {
+        bail!(
+            "VibeVoice MLX worker error: {}",
+            response.error.as_deref().unwrap_or("unknown worker error")
+        );
+    }
+    Ok(response)
 }
 
 fn provision_vibevoice_mlx_runtime(data_dir: &Path) -> Result<PathBuf> {

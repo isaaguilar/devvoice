@@ -2,6 +2,21 @@
 
 DevVoice is a desktop app and local HTTP API for speaking selected text with several local TTS models, including VibeVoice Realtime 0.5B and the higher-quality VibeVoice 1.5B model.
 
+## VibeVoice Realtime 0.5B with MLX
+
+Select `VibeVoice Realtime 0.5B` and leave precision on `auto` to use the persistent 8-bit MLX Audio backend on Apple Silicon macOS. DevVoice provisions a separate Python environment at `~/Library/Application Support/com.isa.devvoice/vibevoice-realtime-mlx-venv`, downloads the quantized model and voice presets, and runs an inference warmup automatically. Setup requires an Apple Silicon Python 3.11 or newer; an existing 1.5B MLX Python environment can provide the interpreter, but its packages are not changed.
+
+The backend uses `mlx-audio==0.6.6` and the pinned `ae6a233e1b2d6d5e2315e7030581323cc8191bb3` revision of `mlx-community/VibeVoice-Realtime-0.5B-8bit`. The model and current voice conditioning stay loaded across requests. All seven existing English and Indian-English preset names are preserved, including `en-Emma_woman`, `en-Grace_woman`, and `in-Samuel_man`. Status reports `python:mlx-audio-int8:realtime` after warmup.
+
+MLX Audio does not support Realtime `style` instructions. Requests containing `style` in Auto mode fail with an explicit error rather than ignoring the instruction. Select `f16`, `bf16`, or `f32` to keep using the built-in Rust backend with its existing controls. The 1.5B MLX backend and environment are unchanged.
+
+```bash
+curl -X POST "http://127.0.0.1:9876/speak?voice_preset=en-Emma_woman" \
+  --data "Ship the build after the tests pass."
+```
+
+The first setup includes package and model downloads; subsequent startup and speech requests reuse the local runtime and cached model files. MLX accelerates generation, but DevVoice still hands audio to playback at its existing text-chunk boundaries.
+
 ## VibeVoice 1.5B usage now
 
 The new 1.5B flow keeps the model practical by using a persistent MLX worker on macOS when:

@@ -560,6 +560,14 @@ impl AppRuntime {
     ) -> Result<()> {
         match model {
             crate::config::VoiceModel::VibeVoiceRealtime => {
+                if overrides.style.is_some()
+                    && cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                    && self.current_config().tts_precision == crate::config::TtsPrecision::Auto
+                {
+                    return Err(anyhow!(
+                        "Realtime MLX (auto precision) does not support style instructions. Select F16, BF16, or F32 to use the Rust backend with style."
+                    ));
+                }
                 if overrides.description.is_some()
                     || overrides.reference_preset_id.is_some()
                     || overrides.reference_preset_name.is_some()
@@ -1029,7 +1037,7 @@ fn describe_model_instructions(model: crate::config::VoiceModel) -> ModelInstruc
             ModelInstructionAttribute {
                 query_param: "style".to_owned(),
                 label: "Instruction prompt".to_owned(),
-                description: "Overrides the realtime model instruction prompt used to shape delivery for this request.".to_owned(),
+                description: "Overrides the realtime model instruction prompt on the Rust backend (F16, BF16, or F32). Not supported by the MLX backend in auto precision.".to_owned(),
             },
         ],
         crate::config::VoiceModel::VibeVoice => vec![
@@ -1107,7 +1115,7 @@ fn describe_model_instructions(model: crate::config::VoiceModel) -> ModelInstruc
 
     let summary = match model {
         crate::config::VoiceModel::VibeVoiceRealtime => {
-            "Fastest local model. Use voice_preset and style for delivery changes. You can also control chunking and optionally save the synthesized WAV per request."
+            "Low-latency local model. Auto precision uses a persistent 8-bit MLX Audio worker on macOS, with automatic setup and inference warmup. Existing voice_preset names are supported. Select F16, BF16, or F32 for the Rust backend if you need style instructions. You can also control chunking and optionally save the synthesized WAV per request."
         }
         crate::config::VoiceModel::VibeVoice => {
             "Long-form expressive model. DevVoice now runs VibeVoice 1.5B through the MLX backend on macOS, using auto precision only. The app warms the model automatically on startup, and you can also call /vibevoice/warmup to preload a saved preset before a real request. Use Speaker 0:, Speaker 1:, and similar labels directly in the request body for dialogue. You can seed voice identity with a raw reference_audio_path, a reusable reference_preset_id, or a unique reference_preset_name created ahead of time. You can also control chunking and optionally save the synthesized WAV per request."
@@ -1122,7 +1130,7 @@ fn describe_model_instructions(model: crate::config::VoiceModel) -> ModelInstruc
 
     let curl_example = match model {
         crate::config::VoiceModel::VibeVoiceRealtime => {
-            r#"curl -X POST "http://127.0.0.1:9876/speak?voice_preset=en-Emma_woman&style=Read%20this%20like%20an%20excited%20demo%20for%20engineers.&chunk_size=0&save_audio=true" --data "Ship the build after the tests pass.""#
+            r#"curl -X POST "http://127.0.0.1:9876/speak?voice_preset=en-Emma_woman&chunk_size=0&save_audio=true" --data "Ship the build after the tests pass.""#
         }
         crate::config::VoiceModel::VibeVoice => {
             "Create a reusable preset once, using a unique name:\n\

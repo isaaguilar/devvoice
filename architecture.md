@@ -15,10 +15,19 @@ AppRuntime
     v
 TtsService
     |
-    +--> Non-VibeVoice or non-MLX case
+    +--> Other models / explicit Realtime precision
     |        |
     |        v
     |    Rust any-tts / Candle backend
+    |
+    +--> Realtime 0.5B + Apple Silicon macOS + auto precision
+    |        |
+    |        v
+    |    Separate persistent Python MLX Audio worker
+    |        |
+    |        +--> cached 8-bit 0.5B model
+    |        +--> cached named voice conditioning
+    |        +--> temporary WAV -> AudioSamples -> playback
     |
     +--> VibeVoice 1.5B + macOS + auto precision + MLX venv present
              |
@@ -37,7 +46,7 @@ TtsService
 
 ## Runtime selection
 
-The MLX path is only selected when all of the following are true:
+The 1.5B MLX path is selected when all of the following are true:
 
 - the selected model is `VibeVoice` (the 1.5B model)
 - the selected precision is `auto`
@@ -45,6 +54,14 @@ The MLX path is only selected when all of the following are true:
 - `~/Library/Application Support/com.isa.devvoice/vibevoice-mlx-venv/bin/python` exists
 
 If the model is `VibeVoice 1.5B`, DevVoice now treats MLX as the supported backend. The old Rust/Candle 1.5B path is no longer treated as the supported fallback for normal use.
+
+### Realtime 0.5B
+
+Realtime uses MLX Audio in `auto` precision on Apple Silicon macOS, with a separate worker and virtual environment from 1.5B. `tts/realtime_mlx.rs` provisions the pinned dependencies, resolves the existing voice preset names, and moves blocking worker communication to Tokio's blocking pool. Concurrent warmup and synthesis calls share one provisioning task and serialize access to the worker.
+
+`vibevoice_realtime_mlx_worker.py` loads the pinned 8-bit model revision, retains the model and current voice conditioning across requests, and writes 24 kHz WAV output. Its generation budget grows with the tokenized text rather than imposing a fixed ceiling on long messages. This changes inference, not DevVoice's existing chunk-based playback pipeline.
+
+Realtime status reports `python:mlx-audio-int8:realtime`. Explicit `f16`, `bf16`, and `f32` choices retain the existing Rust backend. MLX Audio does not implement `style` instructions, so Realtime Auto rejects them explicitly and directs callers to the Rust precision modes.
 
 ## Startup sequence
 
@@ -136,7 +153,7 @@ After opening the app:
 
 ## Known limitations
 
-- The MLX acceleration currently only applies to VibeVoice 1.5B on macOS in `auto` precision mode.
+- MLX acceleration applies to VibeVoice 1.5B and Realtime 0.5B in `auto` precision on Apple Silicon macOS. Realtime uses MLX Audio, not the 1.5B MLX implementation.
 - Older presets created before the durable-audio change may still depend on their original external source path.
 - `/speak` is queue-based. The HTTP response confirms the request was accepted, not that playback or WAV saving has finished yet.
 - In headless or dark-wake situations, playback can still fail even when synthesis itself succeeds.

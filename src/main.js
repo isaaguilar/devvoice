@@ -123,7 +123,9 @@ function syncPrecisionControls(voiceModel, selectedPrecision) {
   if (elements.ttsPrecisionNote) {
     elements.ttsPrecisionNote.textContent = isVibeVoice
       ? "VibeVoice 1.5B now runs through the MLX backend and uses auto precision only. Other models can still use the Rust precision options."
-      : "Auto preserves the current fast 0.5B behavior. Non-VibeVoice models can still use F16, BF16, or F32.";
+      : voiceModel === "vibevoice_realtime"
+        ? "Auto uses the 8-bit MLX Audio backend on macOS. Select F16, BF16, or F32 for the Rust backend and style instructions."
+        : "Auto uses the model's default Rust precision. F16, BF16, and F32 are also available.";
   }
 }
 
