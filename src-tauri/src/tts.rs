@@ -1785,7 +1785,7 @@ fn parler_request_description(preset: Option<&str>, overrides: &SpeechOverrides)
 
 fn vibevoice_max_tokens(text: &str) -> usize {
     let estimated = text.split_whitespace().count().saturating_mul(4) + 16;
-    estimated.clamp(32, 128)
+    estimated.max(32)
 }
 
 fn vibevoice_effective_max_tokens(text: &str, requested: Option<usize>) -> usize {
